@@ -457,8 +457,6 @@ impl<'a, 'b> SpotFulfillmentParams for PhoenixFulfillmentParams<'a, 'b> {
             ),
             use_only_deposited_funds: false,
             // TIF parameters
-            last_valid_slot: None,
-            last_valid_unix_timestamp_in_seconds: None,
         };
 
         let market_accrued_fees_before = market.get_uncollected_fee_amount().as_u64();

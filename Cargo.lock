@@ -833,7 +833,7 @@ dependencies = [
  "num-derive",
  "num-integer",
  "num-traits",
- "phoenix-v1",
+ "phoenix-common",
  "pyth",
  "pyth-client",
  "serum_dex",
@@ -1397,10 +1397,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "phoenix-v1"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a35e8990b3ae5c2026bc274c08ad675da1fcd2630851ce5b7e1e78189d3a602"
+name = "phoenix-common"
+version = "0.1.0"
+source = "git+https://github.com/Ellipsis-Labs/phoenix-v1?branch=crate#ef053c5606bd9a4d111a93596e25fd82e2680a22"
 dependencies = [
  "borsh",
  "bytemuck",
