@@ -52,7 +52,7 @@ impl Size for User {
 }
 
 #[account(zero_copy)]
-#[derive(Default, Eq, PartialEq, Debug)]
+#[derive(Default, Eq, PartialEq, Debug, AnchorDeserialize)]
 #[repr(C)]
 pub struct User {
     /// The owner/authority of the account
@@ -391,7 +391,7 @@ pub struct UserFees {
 }
 
 #[zero_copy]
-#[derive(Default, Eq, PartialEq, Debug)]
+#[derive(Default, Eq, PartialEq, Debug, AnchorDeserialize)]
 #[repr(C)]
 pub struct SpotPosition {
     /// The scaled balance of the position. To get the token amount, multiply by the cumulative deposit/borrow
@@ -505,7 +505,7 @@ impl SpotPosition {
 }
 
 #[zero_copy]
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Default, Debug, Eq, PartialEq, AnchorDeserialize)]
 #[repr(C)]
 pub struct PerpPosition {
     /// The perp market's last cumulative funding rate. Used to calculate the funding payment owed to user
