@@ -8,9 +8,7 @@ use serum_dex::state::ToAlignedBytes;
 use solana_program::msg;
 
 use crate::error::ErrorCode;
-use crate::get_then_update_id;
 use crate::instructions::constraints::*;
-use crate::load;
 use crate::load_mut;
 use crate::math::casting::Cast;
 use crate::math::constants::{
@@ -34,10 +32,12 @@ use crate::state::fulfillment_params::phoenix::PhoenixMarketContext;
 use crate::state::fulfillment_params::phoenix::PhoenixV1FulfillmentConfig;
 use crate::state::fulfillment_params::serum::SerumContext;
 use crate::state::fulfillment_params::serum::SerumV3FulfillmentConfig;
+use crate::state::insurance_fund_stake::ProtocolIfSharesTransferConfig;
 use crate::state::oracle::{
     get_oracle_price, get_pyth_price, HistoricalIndexData, HistoricalOracleData, OraclePriceData,
     OracleSource,
 };
+use crate::state::paused_operations::{PerpOperation, SpotOperation};
 use crate::state::perp_market::{
     ContractTier, ContractType, InsuranceClaim, MarketStatus, PerpMarket, PoolBalance, AMM,
 };
@@ -53,6 +53,8 @@ use crate::validation::margin::{validate_margin, validate_margin_weights};
 use crate::validation::perp_market::validate_perp_market;
 use crate::validation::spot_market::validate_borrow_rate;
 use crate::{controller, QUOTE_PRECISION_I64};
+use crate::{get_then_update_id, EPOCH_DURATION};
+use crate::{load, FEE_ADJUSTMENT_MAX};
 use crate::{math, safe_decrement, safe_increment};
 
 pub fn handle_initialize(ctx: Context<Initialize>) -> Result<()> {
@@ -82,7 +84,9 @@ pub fn handle_initialize(ctx: Context<Initialize>) -> Result<()> {
         lp_cooldown_time: 0,
         liquidation_duration: 0,
         initial_pct_to_liquidate: 0,
-        padding: [0; 14],
+        max_number_of_sub_accounts: 0,
+        max_initialize_user_fee: 0,
+        padding: [0; 10],
     };
 
     Ok(())
@@ -263,11 +267,13 @@ pub fn handle_initialize_spot_market(
         spot_fee_pool: PoolBalance::default(), // in quote asset
         total_spot_fee: 0,
         orders_enabled: spot_market_index != 0,
-        padding1: [0; 6],
+        paused_operations: 0,
+        padding1: [0; 5],
         flash_loan_amount: 0,
         flash_loan_initial_token_amount: 0,
         total_swap_fee: 0,
-        padding: [0; 56],
+        scale_initial_asset_weight_start: 0,
+        padding: [0; 48],
         insurance_fund: InsuranceFund {
             vault: *ctx.accounts.insurance_fund_vault.to_account_info().key,
             unstaking_period: THIRTEEN_DAY,
@@ -628,9 +634,10 @@ pub fn handle_initialize_perp_market(
         unrealized_pnl_max_imbalance: 0,
         liquidator_fee,
         if_liquidation_fee: LIQUIDATION_FEE_PRECISION / 100, // 1%
-        padding1: false,
+        paused_operations: 0,
         quote_spot_market_index: 0,
-        padding: [0; 48],
+        fee_adjustment: 0,
+        padding: [0; 46],
         amm: AMM {
             oracle: *ctx.accounts.oracle.key,
             oracle_source,
@@ -718,9 +725,14 @@ pub fn handle_initialize_perp_market(
 
             last_oracle_valid: false,
             target_base_asset_amount_per_lp: 0,
+            per_lp_base: 0,
             padding1: 0,
+            padding2: 0,
             total_fee_earned_per_lp: 0,
-            padding: [0; 32],
+            net_unsettled_funding_pnl: 0,
+            quote_asset_amount_with_unsettled_lp: 0,
+            reference_price_offset: 0,
+            padding: [0; 12],
         },
     };
 
@@ -852,6 +864,21 @@ pub fn handle_move_amm_price(
         quote_asset_reserve,
         sqrt_k,
     )?;
+    validate_perp_market(perp_market)?;
+
+    Ok(())
+}
+
+#[access_control(
+    perp_market_valid(&ctx.accounts.perp_market)
+)]
+pub fn handle_recenter_perp_market_amm(
+    ctx: Context<AdminUpdatePerpMarket>,
+    peg_multiplier: u128,
+    sqrt_k: u128,
+) -> Result<()> {
+    let perp_market = &mut load_mut!(ctx.accounts.perp_market)?;
+    controller::amm::recenter_perp_market_amm(&mut perp_market.amm, peg_multiplier, sqrt_k)?;
     validate_perp_market(perp_market)?;
 
     Ok(())
@@ -1156,7 +1183,7 @@ pub fn handle_update_k(ctx: Context<AdminUpdateK>, sqrt_k: u128) -> Result<()> {
 
     let update_k_result = get_update_k_result(perp_market, new_sqrt_k_u192, true)?;
 
-    let adjustment_cost = math::cp_curve::adjust_k_cost(perp_market, &update_k_result)?;
+    let adjustment_cost: i128 = math::cp_curve::adjust_k_cost(perp_market, &update_k_result)?;
 
     math::cp_curve::update_k(perp_market, &update_k_result)?;
 
@@ -1419,6 +1446,9 @@ pub fn handle_update_perp_market_max_imbalances(
     perp_market.unrealized_pnl_max_imbalance = unrealized_max_imbalance;
     perp_market.insurance_claim.quote_max_insurance = quote_max_insurance;
 
+    // ensure altered max_revenue_withdraw_per_period doesn't break invariant check
+    crate::validation::perp_market::validate_perp_market(perp_market)?;
+
     Ok(())
 }
 
@@ -1605,8 +1635,24 @@ pub fn handle_update_spot_market_status(
     ctx: Context<AdminUpdateSpotMarket>,
     status: MarketStatus,
 ) -> Result<()> {
+    status.validate_not_deprecated()?;
     let spot_market = &mut load_mut!(ctx.accounts.spot_market)?;
     spot_market.status = status;
+    Ok(())
+}
+
+#[access_control(
+spot_market_valid(&ctx.accounts.spot_market)
+)]
+pub fn handle_update_spot_market_paused_operations(
+    ctx: Context<AdminUpdateSpotMarket>,
+    paused_operations: u8,
+) -> Result<()> {
+    let spot_market = &mut load_mut!(ctx.accounts.spot_market)?;
+    spot_market.paused_operations = paused_operations;
+
+    SpotOperation::log_all_operations_paused(spot_market.paused_operations);
+
     Ok(())
 }
 
@@ -1692,6 +1738,18 @@ pub fn handle_update_spot_market_max_token_deposits(
 }
 
 #[access_control(
+spot_market_valid(&ctx.accounts.spot_market)
+)]
+pub fn handle_update_spot_market_scale_initial_asset_weight_start(
+    ctx: Context<AdminUpdateSpotMarket>,
+    scale_initial_asset_weight_start: u64,
+) -> Result<()> {
+    let spot_market = &mut load_mut!(ctx.accounts.spot_market)?;
+    spot_market.scale_initial_asset_weight_start = scale_initial_asset_weight_start;
+    Ok(())
+}
+
+#[access_control(
     spot_market_valid(&ctx.accounts.spot_market)
 )]
 pub fn handle_update_spot_market_orders_enabled(
@@ -1716,8 +1774,25 @@ pub fn handle_update_perp_market_status(
         "must set settlement/delist through another instruction",
     )?;
 
+    status.validate_not_deprecated()?;
+
     let perp_market = &mut load_mut!(ctx.accounts.perp_market)?;
     perp_market.status = status;
+    Ok(())
+}
+
+#[access_control(
+    perp_market_valid(&ctx.accounts.perp_market)
+)]
+pub fn handle_update_perp_market_paused_operations(
+    ctx: Context<AdminUpdatePerpMarket>,
+    paused_operations: u8,
+) -> Result<()> {
+    let perp_market = &mut load_mut!(ctx.accounts.perp_market)?;
+    perp_market.paused_operations = paused_operations;
+
+    PerpOperation::log_all_operations_paused(perp_market.paused_operations);
+
     Ok(())
 }
 
@@ -1820,8 +1895,10 @@ pub fn handle_update_perp_market_curve_update_intensity(
     ctx: Context<AdminUpdatePerpMarket>,
     curve_update_intensity: u8,
 ) -> Result<()> {
+    // (0, 100] is for repeg / formulaic k intensity
+    // (100, 200] is for reference price offset intensity
     validate!(
-        curve_update_intensity <= 100,
+        curve_update_intensity <= 200,
         ErrorCode::DefaultError,
         "invalid curve_update_intensity",
     )?;
@@ -1839,6 +1916,38 @@ pub fn handle_update_perp_market_target_base_asset_amount_per_lp(
 ) -> Result<()> {
     let perp_market = &mut load_mut!(ctx.accounts.perp_market)?;
     perp_market.amm.target_base_asset_amount_per_lp = target_base_asset_amount_per_lp;
+    Ok(())
+}
+
+pub fn handle_update_perp_market_per_lp_base(
+    ctx: Context<AdminUpdatePerpMarket>,
+    per_lp_base: i8,
+) -> Result<()> {
+    let perp_market = &mut load_mut!(ctx.accounts.perp_market)?;
+
+    let old_per_lp_base = perp_market.amm.per_lp_base;
+    msg!(
+        "updated perp_market per_lp_base {} -> {}",
+        old_per_lp_base,
+        per_lp_base
+    );
+
+    let expo_diff = per_lp_base.safe_sub(old_per_lp_base)?;
+
+    validate!(
+        expo_diff.abs() == 1,
+        ErrorCode::DefaultError,
+        "invalid expo update (must be 1)",
+    )?;
+
+    validate!(
+        per_lp_base.abs() <= 9,
+        ErrorCode::DefaultError,
+        "only consider lp_base within range of AMM_RESERVE_PRECISION",
+    )?;
+
+    controller::lp::apply_lp_rebase_to_perp_market(perp_market, expo_diff)?;
+
     Ok(())
 }
 
@@ -1885,6 +1994,14 @@ pub fn handle_update_liquidation_duration(
     Ok(())
 }
 
+pub fn handle_update_liquidation_margin_buffer_ratio(
+    ctx: Context<AdminUpdateState>,
+    liquidation_margin_buffer_ratio: u32,
+) -> Result<()> {
+    ctx.accounts.state.liquidation_margin_buffer_ratio = liquidation_margin_buffer_ratio;
+    Ok(())
+}
+
 pub fn handle_update_oracle_guard_rails(
     ctx: Context<AdminUpdateState>,
     oracle_guard_rails: OracleGuardRails,
@@ -1898,6 +2015,22 @@ pub fn handle_update_state_settlement_duration(
     settlement_duration: u16,
 ) -> Result<()> {
     ctx.accounts.state.settlement_duration = settlement_duration;
+    Ok(())
+}
+
+pub fn handle_update_state_max_number_of_sub_accounts(
+    ctx: Context<AdminUpdateState>,
+    max_number_of_sub_accounts: u16,
+) -> Result<()> {
+    ctx.accounts.state.max_number_of_sub_accounts = max_number_of_sub_accounts;
+    Ok(())
+}
+
+pub fn handle_update_state_max_initialize_user_fee(
+    ctx: Context<AdminUpdateState>,
+    max_initialize_user_fee: u16,
+) -> Result<()> {
+    ctx.accounts.state.max_initialize_user_fee = max_initialize_user_fee;
     Ok(())
 }
 
@@ -2095,6 +2228,27 @@ pub fn handle_update_perp_market_max_open_interest(
     Ok(())
 }
 
+#[access_control(
+    perp_market_valid(&ctx.accounts.perp_market)
+)]
+pub fn handle_update_perp_market_fee_adjustment(
+    ctx: Context<AdminUpdatePerpMarket>,
+    fee_adjustment: i16,
+) -> Result<()> {
+    let perp_market = &mut load_mut!(ctx.accounts.perp_market)?;
+
+    validate!(
+        fee_adjustment.unsigned_abs().cast::<u64>()? <= FEE_ADJUSTMENT_MAX,
+        ErrorCode::DefaultError,
+        "fee adjustment {} greater than max {}",
+        fee_adjustment,
+        FEE_ADJUSTMENT_MAX
+    )?;
+
+    perp_market.fee_adjustment = fee_adjustment;
+    Ok(())
+}
+
 pub fn handle_update_admin(ctx: Context<AdminUpdateState>, admin: Pubkey) -> Result<()> {
     ctx.accounts.state.admin = admin;
     Ok(())
@@ -2194,6 +2348,37 @@ pub fn handle_admin_disable_update_perp_bid_ask_twap(
 ) -> Result<()> {
     let mut user_stats = load_mut!(ctx.accounts.user_stats)?;
     user_stats.disable_update_perp_bid_ask_twap = disable;
+    Ok(())
+}
+
+pub fn handle_initialize_protocol_if_shares_transfer_config(
+    ctx: Context<InitializeProtocolIfSharesTransferConfig>,
+) -> Result<()> {
+    let mut config = ctx
+        .accounts
+        .protocol_if_shares_transfer_config
+        .load_init()?;
+
+    let now = Clock::get()?.unix_timestamp;
+    config.next_epoch_ts = now.safe_add(EPOCH_DURATION)?;
+
+    Ok(())
+}
+
+pub fn handle_update_protocol_if_shares_transfer_config(
+    ctx: Context<UpdateProtocolIfSharesTransferConfig>,
+    whitelisted_signers: Option<[Pubkey; 4]>,
+    max_transfer_per_epoch: Option<u128>,
+) -> Result<()> {
+    let mut config = ctx.accounts.protocol_if_shares_transfer_config.load_mut()?;
+
+    if let Some(whitelisted_signers) = whitelisted_signers {
+        config.whitelisted_signers = whitelisted_signers;
+    }
+
+    if let Some(max_transfer_per_epoch) = max_transfer_per_epoch {
+        config.max_transfer_per_epoch = max_transfer_per_epoch;
+    }
     Ok(())
 }
 
@@ -2591,4 +2776,40 @@ pub struct AdminDisableBidAskTwapUpdate<'info> {
     pub state: Box<Account<'info, State>>,
     #[account(mut)]
     pub user_stats: AccountLoader<'info, UserStats>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeProtocolIfSharesTransferConfig<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(
+        init,
+        seeds = [b"if_shares_transfer_config".as_ref()],
+        space = ProtocolIfSharesTransferConfig::SIZE,
+        bump,
+        payer = admin
+    )]
+    pub protocol_if_shares_transfer_config: AccountLoader<'info, ProtocolIfSharesTransferConfig>,
+    #[account(
+        has_one = admin
+    )]
+    pub state: Box<Account<'info, State>>,
+    pub rent: Sysvar<'info, Rent>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateProtocolIfSharesTransferConfig<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"if_shares_transfer_config".as_ref()],
+        bump,
+    )]
+    pub protocol_if_shares_transfer_config: AccountLoader<'info, ProtocolIfSharesTransferConfig>,
+    #[account(
+        has_one = admin
+    )]
+    pub state: Box<Account<'info, State>>,
 }

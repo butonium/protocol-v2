@@ -10,7 +10,8 @@ use crate::math::constants::BID_ASK_SPREAD_PRECISION;
 use crate::math::safe_math::SafeMath;
 
 use crate::state::oracle::OraclePriceData;
-use crate::state::perp_market::{MarketStatus, PerpMarket, AMM};
+use crate::state::paused_operations::PerpOperation;
+use crate::state::perp_market::{PerpMarket, AMM};
 use crate::state::state::{OracleGuardRails, ValidityGuardRails};
 
 #[cfg(test)]
@@ -105,6 +106,7 @@ pub fn block_operation(
     oracle_price_data: &OraclePriceData,
     guard_rails: &OracleGuardRails,
     precomputed_reserve_price: Option<u64>,
+    slot: u64,
 ) -> DriftResult<bool> {
     let OracleStatus {
         oracle_validity,
@@ -120,9 +122,14 @@ pub fn block_operation(
     let is_oracle_valid =
         is_oracle_valid_for_action(oracle_validity, Some(DriftAction::UpdateFunding))?;
 
-    let funding_paused_on_market = market.status == MarketStatus::FundingPaused;
+    let slots_since_amm_update = slot.saturating_sub(market.amm.last_update_slot);
 
-    let block = !is_oracle_valid || is_oracle_mark_too_divergent || funding_paused_on_market;
+    let funding_paused_on_market = market.is_operation_paused(PerpOperation::UpdateFunding);
+
+    let block = slots_since_amm_update > 10
+        || !is_oracle_valid
+        || is_oracle_mark_too_divergent
+        || funding_paused_on_market;
     Ok(block)
 }
 

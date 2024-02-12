@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 
 use std::cmp::max;
 
-use crate::controller::position::PositionDirection;
+use crate::controller::position::{PositionDelta, PositionDirection};
 use crate::error::{DriftResult, ErrorCode};
 use crate::math::amm;
 use crate::math::casting::Cast;
@@ -11,8 +11,9 @@ use crate::math::constants::{
     AMM_RESERVE_PRECISION, MAX_CONCENTRATION_COEFFICIENT, PRICE_PRECISION_I64,
 };
 use crate::math::constants::{
-    BASE_PRECISION, BID_ASK_SPREAD_PRECISION_U128, MARGIN_PRECISION_U128, SPOT_WEIGHT_PRECISION,
-    TWENTY_FOUR_HOUR,
+    AMM_RESERVE_PRECISION_I128, BID_ASK_SPREAD_PRECISION, BID_ASK_SPREAD_PRECISION_U128,
+    LP_FEE_SLICE_DENOMINATOR, LP_FEE_SLICE_NUMERATOR, MARGIN_PRECISION_U128, PERCENTAGE_PRECISION,
+    SPOT_WEIGHT_PRECISION, TWENTY_FOUR_HOUR,
 };
 use crate::math::helpers::get_proportion_i128;
 
@@ -30,19 +31,26 @@ use crate::state::traits::{MarketIndexOffset, Size};
 use crate::{AMM_TO_QUOTE_PRECISION_RATIO, PRICE_PRECISION};
 use borsh::{BorshDeserialize, BorshSerialize};
 
+use crate::state::paused_operations::PerpOperation;
+use drift_macros::assert_no_slop;
+use static_assertions::const_assert_eq;
+
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq)]
 pub enum MarketStatus {
     /// warm up period for initialization, fills are paused
     Initialized,
     /// all operations allowed
     Active,
-    /// funding rate updates are paused
+    /// Deprecated in favor of PausedOperations
     FundingPaused,
-    /// amm fills are prevented/blocked
+    /// Deprecated in favor of PausedOperations
     AmmPaused,
-    /// fills are blocked
+    /// Deprecated in favor of PausedOperations
     FillPaused,
-    /// perp: pause settling negative pnl | spot: pause depositing asset
+    /// Deprecated in favor of PausedOperations
     WithdrawPaused,
     /// fills only able to reduce liability
     ReduceOnly,
@@ -55,6 +63,23 @@ pub enum MarketStatus {
 impl Default for MarketStatus {
     fn default() -> Self {
         MarketStatus::Initialized
+    }
+}
+
+impl MarketStatus {
+    pub fn validate_not_deprecated(&self) -> DriftResult {
+        if matches!(
+            self,
+            MarketStatus::FundingPaused
+                | MarketStatus::AmmPaused
+                | MarketStatus::FillPaused
+                | MarketStatus::WithdrawPaused
+        ) {
+            msg!("MarketStatus is deprecated");
+            Err(ErrorCode::DefaultError)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -124,7 +149,7 @@ impl AMMLiquiditySplit {
     }
 }
 
-#[account(zero_copy)]
+#[account(zero_copy(unsafe))]
 #[derive(Eq, PartialEq, Debug)]
 #[repr(C)]
 pub struct PerpMarket {
@@ -195,10 +220,14 @@ pub struct PerpMarket {
     /// The contract tier determines how much insurance a market can receive, with more speculative markets receiving less insurance
     /// It also influences the order perp markets can be liquidated, with less speculative markets being liquidated first
     pub contract_tier: ContractTier,
-    pub padding1: bool,
+    pub paused_operations: u8,
     /// The spot market that pnl is settled in
     pub quote_spot_market_index: u16,
-    pub padding: [u8; 48],
+    /// Between -100 and 100, represents what % to increase/decrease the fee by
+    /// E.g. if this is -50 and the fee is 5bps, the new fee will be 2.5bps
+    /// if this is 50 and the fee is 5bps, the new fee will be 7.5bps
+    pub fee_adjustment: i16,
+    pub padding: [u8; 46],
 }
 
 impl Default for PerpMarket {
@@ -229,9 +258,10 @@ impl Default for PerpMarket {
             status: MarketStatus::default(),
             contract_type: ContractType::default(),
             contract_tier: ContractTier::default(),
-            padding1: false,
+            paused_operations: 0,
             quote_spot_market_index: 0,
-            padding: [0; 48],
+            fee_adjustment: 0,
+            padding: [0; 46],
         }
     }
 }
@@ -245,17 +275,21 @@ impl MarketIndexOffset for PerpMarket {
 }
 
 impl PerpMarket {
-    pub fn is_active(&self, now: i64) -> DriftResult<bool> {
-        let status_ok = !matches!(
+    pub fn is_in_settlement(&self, now: i64) -> bool {
+        let in_settlement = matches!(
             self.status,
             MarketStatus::Settlement | MarketStatus::Delisted
         );
-        let not_expired = self.expiry_ts == 0 || now < self.expiry_ts;
-        Ok(status_ok && not_expired)
+        let expired = self.expiry_ts != 0 && now >= self.expiry_ts;
+        in_settlement || expired
     }
 
     pub fn is_reduce_only(&self) -> DriftResult<bool> {
         Ok(self.status == MarketStatus::ReduceOnly)
+    }
+
+    pub fn is_operation_paused(&self, operation: PerpOperation) -> bool {
+        PerpOperation::is_operation_paused(self.paused_operations, operation)
     }
 
     pub fn get_sanitize_clamp_denominator(self) -> DriftResult<Option<i64>> {
@@ -266,6 +300,30 @@ impl PerpMarket {
             ContractTier::Speculative => None, // DEFAULT_MAX_TWAP_UPDATE_PRICE_BAND_DENOMINATOR
             ContractTier::Isolated => None,    // DEFAULT_MAX_TWAP_UPDATE_PRICE_BAND_DENOMINATOR
         })
+    }
+
+    pub fn get_auction_end_min_max_divisors(self) -> DriftResult<(u64, u64)> {
+        Ok(match self.contract_tier {
+            ContractTier::A => (1000, 50),          // 10 bps, 2%
+            ContractTier::B => (1000, 20),          // 10 bps, 5%
+            ContractTier::C => (500, 20),           // 50 bps, 5%
+            ContractTier::Speculative => (100, 10), // 1%, 10%
+            ContractTier::Isolated => (50, 5),      // 2%, 20%
+        })
+    }
+
+    pub fn get_max_price_divergence_for_funding_rate(
+        self,
+        oracle_price_twap: i64,
+    ) -> DriftResult<i64> {
+        // clamp to to 3% price divergence for safer markets and higher for lower contract tiers
+        if self.contract_tier.is_as_safe_as_contract(&ContractTier::B) {
+            oracle_price_twap.safe_div(33) // 3%
+        } else if self.contract_tier.is_as_safe_as_contract(&ContractTier::C) {
+            oracle_price_twap.safe_div(20) // 5%
+        } else {
+            oracle_price_twap.safe_div(10) // 10%
+        }
     }
 
     pub fn get_margin_ratio(
@@ -409,7 +467,7 @@ impl PerpMarket {
     }
 }
 
-#[zero_copy]
+#[zero_copy(unsafe)]
 #[derive(Default, Eq, PartialEq, Debug)]
 #[repr(C)]
 pub struct InsuranceClaim {
@@ -431,7 +489,7 @@ pub struct InsuranceClaim {
     pub last_revenue_withdraw_ts: i64,
 }
 
-#[zero_copy]
+#[zero_copy(unsafe)]
 #[derive(Default, Eq, PartialEq, Debug)]
 #[repr(C)]
 pub struct PoolBalance {
@@ -472,7 +530,8 @@ impl SpotBalance for PoolBalance {
     }
 }
 
-#[zero_copy]
+#[assert_no_slop]
+#[zero_copy(unsafe)]
 #[derive(Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct AMM {
@@ -644,9 +703,15 @@ pub struct AMM {
     /// the target value for `base_asset_amount_per_lp`, used during AMM JIT with LP split
     /// precision: BASE_PRECISION
     pub target_base_asset_amount_per_lp: i32,
-    pub padding1: u32,
+    /// expo for unit of per_lp, base 10 (if per_lp_base=X, then per_lp unit is 10^X)
+    pub per_lp_base: i8,
+    pub padding1: u8,
+    pub padding2: u16,
     pub total_fee_earned_per_lp: u64,
-    pub padding: [u8; 32],
+    pub net_unsettled_funding_pnl: i64,
+    pub quote_asset_amount_with_unsettled_lp: i64,
+    pub reference_price_offset: i32,
+    pub padding: [u8; 12],
 }
 
 impl Default for AMM {
@@ -728,20 +793,203 @@ impl Default for AMM {
             oracle_source: OracleSource::default(),
             last_oracle_valid: false,
             target_base_asset_amount_per_lp: 0,
+            per_lp_base: 0,
             padding1: 0,
+            padding2: 0,
             total_fee_earned_per_lp: 0,
-            padding: [0; 32],
+            net_unsettled_funding_pnl: 0,
+            quote_asset_amount_with_unsettled_lp: 0,
+            reference_price_offset: 0,
+            padding: [0; 12],
         }
     }
 }
 
 impl AMM {
+    pub fn get_fallback_price(
+        self,
+        direction: &PositionDirection,
+        amm_available_liquidity: u64,
+        oracle_price: i64,
+        seconds_til_order_expiry: i64,
+    ) -> DriftResult<u64> {
+        // PRICE_PRECISION
+        if direction.eq(&PositionDirection::Long) {
+            // pick amm ask + buffer if theres liquidity
+            // otherwise be aggressive vs oracle + 1hr premium
+            if amm_available_liquidity >= self.min_order_size {
+                let reserve_price = self.reserve_price()?;
+                let amm_ask_price: i64 = self.ask_price(reserve_price)?.cast()?;
+                amm_ask_price
+                    .safe_add(amm_ask_price / (seconds_til_order_expiry * 20).clamp(100, 200))?
+                    .cast::<u64>()
+            } else {
+                oracle_price
+                    .safe_add(
+                        self.last_ask_price_twap
+                            .cast::<i64>()?
+                            .safe_sub(self.historical_oracle_data.last_oracle_price_twap)?
+                            .max(0),
+                    )?
+                    .safe_add(oracle_price / (seconds_til_order_expiry * 2).clamp(10, 50))?
+                    .cast::<u64>()
+            }
+        } else {
+            // pick amm bid - buffer if theres liquidity
+            // otherwise be aggressive vs oracle + 1hr bid premium
+            if amm_available_liquidity >= self.min_order_size {
+                let reserve_price = self.reserve_price()?;
+                let amm_bid_price: i64 = self.bid_price(reserve_price)?.cast()?;
+                amm_bid_price
+                    .safe_sub(amm_bid_price / (seconds_til_order_expiry * 20).clamp(100, 200))?
+                    .cast::<u64>()
+            } else {
+                oracle_price
+                    .safe_add(
+                        self.last_bid_price_twap
+                            .cast::<i64>()?
+                            .safe_sub(self.historical_oracle_data.last_oracle_price_twap)?
+                            .min(0),
+                    )?
+                    .safe_sub(oracle_price / (seconds_til_order_expiry * 2).clamp(10, 50))?
+                    .max(0)
+                    .cast::<u64>()
+            }
+        }
+    }
+
+    pub fn get_lower_bound_sqrt_k(self) -> DriftResult<u128> {
+        Ok(self.sqrt_k.min(
+            self.user_lp_shares
+                .safe_add(self.user_lp_shares.safe_div(1000)?)?
+                .max(self.min_order_size.cast()?)
+                .max(self.base_asset_amount_with_amm.unsigned_abs().cast()?),
+        ))
+    }
+
+    pub fn get_protocol_owned_position(self) -> DriftResult<i64> {
+        self.base_asset_amount_with_amm
+            .safe_add(self.base_asset_amount_with_unsettled_lp)?
+            .cast::<i64>()
+    }
+
+    pub fn get_max_reference_price_offset(self) -> DriftResult<i64> {
+        if self.curve_update_intensity <= 100 {
+            return Ok(0);
+        }
+
+        let lower_bound_multiplier: i64 =
+            self.curve_update_intensity.safe_sub(100)?.cast::<i64>()?;
+
+        // always allow 1-100 bps of price offset, up to a fifth of the market's max_spread
+        let lb_bps =
+            (PERCENTAGE_PRECISION.cast::<i64>()? / 10000).safe_mul(lower_bound_multiplier)?;
+        let max_offset = (self.max_spread.cast::<i64>()? / 5).max(lb_bps);
+
+        Ok(max_offset)
+    }
+
+    pub fn get_per_lp_base_unit(self) -> DriftResult<i128> {
+        let scalar: i128 = 10_i128.pow(self.per_lp_base.abs().cast()?);
+
+        if self.per_lp_base > 0 {
+            AMM_RESERVE_PRECISION_I128.safe_mul(scalar)
+        } else {
+            AMM_RESERVE_PRECISION_I128.safe_div(scalar)
+        }
+    }
+
+    pub fn calculate_lp_base_delta(
+        &self,
+        per_lp_delta_base: i128,
+        base_unit: i128,
+    ) -> DriftResult<i128> {
+        // calculate dedicated for user lp shares
+        let lp_delta_base =
+            get_proportion_i128(per_lp_delta_base, self.user_lp_shares, base_unit.cast()?)?;
+
+        Ok(lp_delta_base)
+    }
+
+    pub fn calculate_per_lp_delta(
+        &self,
+        delta: &PositionDelta,
+        fee_to_market: i128,
+        liquidity_split: AMMLiquiditySplit,
+        base_unit: i128,
+    ) -> DriftResult<(i128, i128, i128)> {
+        let total_lp_shares = if liquidity_split == AMMLiquiditySplit::LPOwned {
+            self.user_lp_shares
+        } else {
+            self.sqrt_k
+        };
+
+        // update Market per lp position
+        let per_lp_delta_base = get_proportion_i128(
+            delta.base_asset_amount.cast()?,
+            base_unit.cast()?,
+            total_lp_shares, //.safe_div_ceil(rebase_divisor.cast()?)?,
+        )?;
+
+        let mut per_lp_delta_quote = get_proportion_i128(
+            delta.quote_asset_amount.cast()?,
+            base_unit.cast()?,
+            total_lp_shares, //.safe_div_ceil(rebase_divisor.cast()?)?,
+        )?;
+
+        // user position delta is short => lp position delta is long
+        if per_lp_delta_base < 0 {
+            // add one => lp subtract 1
+            per_lp_delta_quote = per_lp_delta_quote.safe_add(1)?;
+        }
+
+        // 1/5 of fee auto goes to market
+        // the rest goes to lps/market proportional
+        let per_lp_fee: i128 = if fee_to_market > 0 {
+            get_proportion_i128(
+                fee_to_market,
+                LP_FEE_SLICE_NUMERATOR,
+                LP_FEE_SLICE_DENOMINATOR,
+            )?
+            .safe_mul(base_unit)?
+            .safe_div(total_lp_shares.cast::<i128>()?)?
+        } else {
+            0
+        };
+
+        Ok((per_lp_delta_base, per_lp_delta_quote, per_lp_fee))
+    }
+
+    pub fn get_target_base_asset_amount_per_lp(&self) -> DriftResult<i128> {
+        if self.target_base_asset_amount_per_lp == 0 {
+            return Ok(0_i128);
+        }
+
+        let target_base_asset_amount_per_lp: i128 = if self.per_lp_base > 0 {
+            let rebase_divisor = 10_i128.pow(self.per_lp_base.abs().cast()?);
+            self.target_base_asset_amount_per_lp
+                .cast::<i128>()?
+                .safe_mul(rebase_divisor)?
+        } else if self.per_lp_base < 0 {
+            let rebase_divisor = 10_i128.pow(self.per_lp_base.abs().cast()?);
+            self.target_base_asset_amount_per_lp
+                .cast::<i128>()?
+                .safe_div(rebase_divisor)?
+        } else {
+            self.target_base_asset_amount_per_lp.cast::<i128>()?
+        };
+
+        Ok(target_base_asset_amount_per_lp)
+    }
+
     pub fn imbalanced_base_asset_amount_with_lp(&self) -> DriftResult<i128> {
         let target_lp_gap = self
             .base_asset_amount_per_lp
-            .safe_sub(self.target_base_asset_amount_per_lp.cast()?)?;
+            .safe_sub(self.get_target_base_asset_amount_per_lp()?)?;
 
-        get_proportion_i128(target_lp_gap, self.user_lp_shares, BASE_PRECISION)
+        let base_unit = self.get_per_lp_base_unit()?.cast()?;
+
+        get_proportion_i128(target_lp_gap, self.user_lp_shares, base_unit)
     }
 
     pub fn amm_wants_to_jit_make(&self, taker_direction: PositionDirection) -> DriftResult<bool> {
@@ -766,10 +1014,10 @@ impl AMM {
 
         let amm_lp_wants_to_jit_make = match taker_direction {
             PositionDirection::Long => {
-                self.base_asset_amount_per_lp > self.target_base_asset_amount_per_lp.cast()?
+                self.base_asset_amount_per_lp > self.get_target_base_asset_amount_per_lp()?
             }
             PositionDirection::Short => {
-                self.base_asset_amount_per_lp < self.target_base_asset_amount_per_lp.cast()?
+                self.base_asset_amount_per_lp < self.get_target_base_asset_amount_per_lp()?
             }
         };
         Ok(amm_lp_wants_to_jit_make && self.amm_lp_jit_is_active())
@@ -836,6 +1084,20 @@ impl AMM {
         let bid_price = self.bid_price(reserve_price)?;
         let ask_price = self.ask_price(reserve_price)?;
         Ok((bid_price, ask_price))
+    }
+
+    pub fn last_ask_premium(&self) -> DriftResult<i64> {
+        let reserve_price = self.reserve_price()?;
+        let ask_price = self.ask_price(reserve_price)?.cast::<i64>()?;
+        ask_price.safe_sub(self.historical_oracle_data.last_oracle_price)
+    }
+
+    pub fn last_bid_discount(&self) -> DriftResult<i64> {
+        let reserve_price = self.reserve_price()?;
+        let bid_price = self.bid_price(reserve_price)?.cast::<i64>()?;
+        self.historical_oracle_data
+            .last_oracle_price
+            .safe_sub(bid_price)
     }
 
     pub fn can_lower_k(&self) -> DriftResult<bool> {
@@ -912,6 +1174,35 @@ impl AMM {
         self.last_trade_ts = now;
 
         Ok(())
+    }
+
+    pub fn get_new_oracle_conf_pct(
+        &self,
+        confidence: u64,    // price precision
+        reserve_price: u64, // price precision
+        now: i64,
+    ) -> DriftResult<u64> {
+        // use previous value decayed as lower bound to avoid shrinking too quickly
+        let upper_bound_divisor = 21_u64;
+        let lower_bound_divisor = 5_u64;
+        let since_last = now
+            .safe_sub(self.historical_oracle_data.last_oracle_price_twap_ts)?
+            .max(0);
+
+        let confidence_lower_bound = if since_last > 0 {
+            let confidence_divisor = upper_bound_divisor
+                .saturating_sub(since_last.cast::<u64>()?)
+                .max(lower_bound_divisor);
+            self.last_oracle_conf_pct
+                .safe_sub(self.last_oracle_conf_pct / confidence_divisor)?
+        } else {
+            self.last_oracle_conf_pct
+        };
+
+        Ok(confidence
+            .safe_mul(BID_ASK_SPREAD_PRECISION)?
+            .safe_div(reserve_price)?
+            .max(confidence_lower_bound))
     }
 }
 

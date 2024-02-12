@@ -13,13 +13,332 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+## [2.61.0] - 2023-02-09
+
+### Features
+
+- program: better derivation of perp auction params when missing and for triggers ([#869](https://github.com/drift-labs/protocol-v2/pull/869))
+- program: calculate whether oracle's num quoters sufficient ([#860](https://github.com/drift-labs/protocol-v2/pull/860))
+
+### Fixes
+
+- program: include derisk lp order action explanation
+
+### Breaking
+
+## [2.60.0] - 2023-02-07
+
+### Features
+
+- program: sanitize perp auction params ([#859](https://github.com/drift-labs/protocol-v2/pull/859))
+- program: add repay borrow explanation ([#862](https://github.com/drift-labs/protocol-v2/pull/862))
+- program: derisk lp more granularly ([#849](https://github.com/drift-labs/protocol-v2/pull/849))
+
+### Fixes
+
+### Breaking
+
+## [2.59.0] - 2023-01-30
+
+### Features
+
+- program: separate out paused operations from market status ([#839](https://github.com/drift-labs/protocol-v2/pull/839))
+- program: use decayed last_oracle_conf_pct as lower bound for update ([#840](https://github.com/drift-labs/protocol-v2/pull/840))
+
+### Fixes
+
+### Breaking
+
+## [2.58.0] - 2023-01-27
+
+### Features
+
+### Fixes
+
+- program: AmmPaused doesnt block all fills
+
+### Breaking
+
+## [2.57.0] - 2023-01-25
+
+### Features
+
+- program: add recenter amm ix ([#836](https://github.com/drift-labs/protocol-v2/pull/836))
+
+### Fixes
+
+### Breaking
+
+## [2.56.0] - 2023-01-24
+
+### Features
+
+### Fixes
+
+- program: enable jit maker to fill same slot as taker placed ([#835](https://github.com/drift-labs/protocol-v2/pull/835))
+
+### Breaking
+
+## [2.55.0] - 2023-01-18
+
+### Features
+
+### Fixes
+
+- program: standardize lp shares in attempt_burn_user_lp_shares_for_risk_reduction ([#826](https://github.com/drift-labs/protocol-v2/pull/826))
+
+### Breaking
+
+## [2.54.0] - 2023-01-15
+
+### Features
+
+- sdk: move bracket orders into single instruction
+- sdk: add ability to do placeAndTake order with bracket orders attached
+- sdk: add option to cancel existing orders in market for place and take order
+- sdk: add option to get signed settlePnl tx back from a market order
+- program: auto derisk lp positions in settle pnl ([#766](https://github.com/drift-labs/protocol-v2/pull/766))
+- program: increase full perp liquidation threshold ([#807](https://github.com/drift-labs/protocol-v2/pull/807))
+- program: remove spot fee pool transfer ([#800](https://github.com/drift-labs/protocol-v2/pull/800))
+- program: increase insurance tier max ([#784](https://github.com/drift-labs/protocol-v2/pull/784))
+- sdk: can specify max custom margin ratio to initialize a new account with
+
+### Fixes
+
+- ts-sdk: contract tier funding rate clamp ([#785](https://github.com/drift-labs/protocol-v2/pull/785))
+- ts-sdk: fix oracle is valid ([#806](https://github.com/drift-labs/protocol-v2/pull/806))
+
+### Breaking
+
+## [2.53.0] - 2023-12-31
+
+### Features
+
+### Fixes
+
+- program: standardize limit auction prices ([#790](https://github.com/drift-labs/protocol-v2/pull/790))
+- program: improve get_fallback_price([#797](https://github.com/drift-labs/protocol-v2/pull/797))
+- program: derive auction for crossing limit with no duration ([#802](https://github.com/drift-labs/protocol-v2/pull/802))
+- sdk: use tx params passed into deposit and withdraw functions
+
+### Breaking
+
+## [2.52.0] - 2023-12-22
+
+### Features
+
+- program: add ability to reclaim rent without deleting account ([#763](https://github.com/drift-labs/protocol-v2/pull/763))
+- program: add borrow explanation to DepositRecords ([#772](https://github.com/drift-labs/protocol-v2/pull/772))
+- sdk: OrderSubscriber has resync option ([#780](https://github.com/drift-labs/protocol-v2/pull/780))
+- program: only consider recent last_active_slot in qualifies_for_withdraw_feen ([#756](https://github.com/drift-labs/protocol-v2/pull/756))
+- program: amm can use reference price offset from oracle price based on clamped inventory and persist market premiums ([#681](https://github.com/drift-labs/protocol-v2/pull/681))
+
+### Fixes
+
+- program: handle underflow in calculate_liability_transfer_to_cover_margin_shortage ([#774](https://github.com/drift-labs/protocol-v2/pull/774))
+- program: flip auction flag when trigger order adds auction ([#775](https://github.com/drift-labs/protocol-v2/pull/775))
+- program: don't perform funding rate updates when slots_since_amm_update is stale ([#757](https://github.com/drift-labs/protocol-v2/pull/757))
+- program: add update last slot for filler in pay_keeper_flat_reward_for_spot
+
+### Breaking
+
+## [2.51.0] - 2023-12-09
+
+### Features
+
+### Fixes
+
+- program: consistent user of fee budget in calculate_optimal_peg_and_budget ([#754](https://github.com/drift-labs/protocol-v2/pull/754))
+
+### Breaking
+
+## [2.50.0] - 2023-12-09
+
+### Features
+
+### Fixes
+
+- program: better account for liquidation fees in calculate_optimal_peg_and_budget ([#754](https://github.com/drift-labs/protocol-v2/pull/754))
+
+### Breaking
+
+## [2.49.0] - 2023-12-08
+
+## [Unreleased]
+
+### Features
+
+- program: add init user fee ([#752](https://github.com/drift-labs/protocol-v2/pull/752))
+- program: vamm gives maker rebate ([#653](https://github.com/drift-labs/protocol-v2/pull/653))
+
+### Fixes
+
+### Breaking
+
+## [2.48.0] - 2023-12-01
+
+### Features
+
+### Fixes
+
+- program: account for step size when canceling reduce only orders
+
+### Breaking
+
+- sdk: UserStatsMap use bulkAccountLoader (`UserStatsMap.subscribe` and `UserStatsMap.sync` now requires list of authorities) ([#716](https://github.com/drift-labs/protocol-v2/pull/716))
+
+## [2.47.0] - 2023-11-26
+
+### Features
+
+- program: accelerated idle update for users with <$1000 equity
+
+### Fixes
+
+- ts-sdk: fix to modify order booleans
+
+### Breaking
+
+## [2.46.0] - 2023-11-24
+
+### Features
+
+- program: fill asset weight between init and maintenance ([#713](https://github.com/drift-labs/protocol-v2/pull/713))
+- program: if order reduces maker position, check maintenance margin requirement ([#714](https://github.com/drift-labs/protocol-v2/pull/714))
+
+### Fixes
+
+### Breaking
+
+## [2.45.0] - 2023-11-22
+
+### Features
+
+- program: trigger limits cant make if limit crosses trigger ([#707](https://github.com/drift-labs/protocol-v2/pull/702))
+
+### Fixes
+
+- sdk: fix vamm L2asks by using askAmm ([#708](https://github.com/drift-labs/protocol-v2/pull/708))
+- program: add max_number_of_sub_accounts onto state account ([#710](https://github.com/drift-labs/protocol-v2/pull/710))
+
+### Breaking
+
+## [2.44.0] - 2023-11-17
+
+### Features
+
+### Fixes
+
+- program: exhaustively search for referrer account on fill ([#702](https://github.com/drift-labs/protocol-v2/pull/702))
+
+## [2.43.0] - 2023-11-16
+
+### Features
+
+- program: accelerate liquidations for tiny accounts ([#698](https://github.com/drift-labs/protocol-v2/pull/698))
+- program: boost max sub accounts to 20k
+
+### Fixes
+
+- program: allow amm to fill step size ([#672](https://github.com/drift-labs/protocol-v2/pull/672))
+- program: add add update_liquidation_margin_buffer_ratio ([#695](https://github.com/drift-labs/protocol-v2/pull/695))
+- program: account for fee pool when settling positive pnl ([#687](https://github.com/drift-labs/protocol-v2/pull/687))
+- sdk: fix bug which incorrectly calculated leverage after trade for a market with no position but short orders open
+- sdk: fix bug in modifying an order that previously had auction params to a non-auction order
+- sdk: add delta to calculateDepositRate function
+
+### Breaking
+
+## [2.42.0] - 2023-10-26
+
+### Features
+
+- program: add accelerated user update idle ([#669](https://github.com/drift-labs/protocol-v2/pull/669))
+- program: make user status a bit flag ([#619](https://github.com/drift-labs/protocol-v2/pull/619))
+- program: place and take uses auction end price for market orders ([#650](https://github.com/drift-labs/protocol-v2/pull/650))
+- program: reduce cus for place_spot_order ([#662](https://github.com/drift-labs/protocol-v2/pull/662))
+- program: bump max sub accounts to 15k
+- program: user custom margin ratio works with spot ([#633](https://github.com/drift-labs/protocol-v2/pull/633))
+- program: add swap price bands ([#611](https://github.com/drift-labs/protocol-v2/pull/611))
+- program: add 5min twap price bands to liquidate_perp and liquidate_spot ([#570](https://github.com/drift-labs/protocol-v2/pull/570))
+- program: add positive perp funding rate offset ([#576](https://github.com/drift-labs/protocol-v2/pull/576/files))
+
+### Fixes
+
+- program: add validation check in update max imbalances ([#667](https://github.com/drift-labs/protocol-v2/pull/667))
+
+### Breaking
+
+- sdk: remove getMakerLimitBids/Asks from DLOB
+- sdk: updateUserMarginEnabled and updateUserCustomMarginRatio now take in an array of params to allow multiple subaccounts to be update in a single tx
+
+## [2.41.0] - 2023-10-05
+
+### Features
+
+- program: order_breaches_maker_oracle_price_bands only uses init margin ratio ([#636](https://github.com/drift-labs/protocol-v2/pull/636))
+- program: add fee_adjustment to perp market ([#629](https://github.com/drift-labs/protocol-v2/pull/629))
+- program: add buffer to calculating max perp if fee ([#635](https://github.com/drift-labs/protocol-v2/pull/635))
+- sdk: remove getMakerLimitBids/Asks ([#632](https://github.com/drift-labs/protocol-v2/pull/632))
+- program: add ix to transfer protocol if shares ([#612](https://github.com/drift-labs/protocol-v2/pull/612))
+
+### Fixes
+
+- program: fix if staking rounding for fee tier selection ([#643](https://github.com/drift-labs/protocol-v2/pull/643))
+
+### Breaking
+
+## [2.40.0] - 2023-09-28
+
+### Features
+
+- program: add dynamic liquidation fee ([#601](https://github.com/drift-labs/protocol-v2/pull/601))
+- sdk: add deriveOracleAuctionParams
+- program: update to anchor 0.27.0 ([#617](https://github.com/drift-labs/protocol-v2/pull/617))
+
+### Fixes
+
+### Breaking
+
+## [2.39.0] - 2023-09-07
+
+### Features
+
+- sdk: updated anchor to 0.28.1-beta.2
+- sdk: add priorityFeeSubscriber
+- program: allow up to 12500 users
+- program: scale initial asset weight for spot markets based on total deposits ([#575](https://github.com/drift-labs/protocol-v2/pull/575))
+
+### Fixes
+
+- program: let auction start/end be the same ([#597](https://github.com/drift-labs/protocol-v2/pull/597))
+- program: account for reduce only when checking margin in trigger order ([#583](https://github.com/drift-labs/protocol-v2/pull/583))
+- program: use per_lp_base_unit for calculating base imbalance for lp jit ([#604](https://github.com/drift-labs/protocol-v2/pull/604))
+
+### Breaking
+
+## [2.38.0] - 2023-08-25
+
+### Features
+
+- program: add reduce only user status ([#560](https://github.com/drift-labs/protocol-v2/pull/560))
+- program: add conditionally smaller conf_component logic for amm spread ([#577](https://github.com/drift-labs/protocol-v2/pull/577))
+- program: add per_lp_base on market/position ([#568](https://github.com/drift-labs/protocol-v2/pull/568))
+
+### Fixes
+
+- program: add update_lp_market_position test for big k ([#565](https://github.com/drift-labs/protocol-v2/pull/565))
+- sdk: fixed divide by 0 bug in withdraw amount when asset weight is 0 ([#572](https://github.com/drift-labs/protocol-v2/pull/572))
+
+### Breaking
+
 ## [2.37.0] - 2023-08-02
 
 ### Features
 
 - program: add deposit_into_spot_market_revenue_pool ([#520](https://github.com/drift-labs/protocol-v2/pull/520))
 - program: make users w excessive withdraws pay fees ([#547](https://github.com/drift-labs/protocol-v2/pull/547))
-- program: allow settle pnl and spot fills via match when utilization is 100% ([#525](https://github.com/drift-labs/protocol-v2/pull/525)) 
+- program: allow settle pnl and spot fills via match when utilization is 100% ([#525](https://github.com/drift-labs/protocol-v2/pull/525))
 - program: new update_perp_bid_ask_twap ix ([#548](https://github.com/drift-labs/protocol-v2/pull/548))
 - program: dont check price bands for place order ([#556](https://github.com/drift-labs/protocol-v2/pull/556))
 

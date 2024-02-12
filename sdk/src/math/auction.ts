@@ -1,5 +1,5 @@
-import { isOneOfVariant, isVariant, Order } from '../types';
-import { BN, ZERO } from '../.';
+import { isOneOfVariant, isVariant, Order, PositionDirection } from '../types';
+import { BN, getVariant, ONE, ZERO } from '../.';
 
 export function isAuctionComplete(order: Order, slot: number): boolean {
 	if (order.auctionDuration === 0) {
@@ -26,12 +26,21 @@ export function getAuctionPrice(
 	slot: number,
 	oraclePrice: BN
 ): BN {
-	if (isOneOfVariant(order.orderType, ['market', 'triggerMarket', 'limit'])) {
+	if (
+		isOneOfVariant(order.orderType, [
+			'market',
+			'triggerMarket',
+			'limit',
+			'triggerLimit',
+		])
+	) {
 		return getAuctionPriceForFixedAuction(order, slot);
 	} else if (isVariant(order.orderType, 'oracle')) {
 		return getAuctionPriceForOracleOffsetAuction(order, slot, oraclePrice);
 	} else {
-		throw Error(`Cant get auction price for order type ${order.orderType}`);
+		throw Error(
+			`Cant get auction price for order type ${getVariant(order.orderType)}`
+		);
 	}
 }
 
@@ -79,7 +88,7 @@ export function getAuctionPriceForOracleOffsetAuction(
 	const deltaNumerator = BN.min(slotsElapsed, deltaDenominator);
 
 	if (deltaDenominator.eq(ZERO)) {
-		return order.auctionEndPrice.add(order.auctionEndPrice);
+		return oraclePrice.add(order.auctionEndPrice);
 	}
 
 	let priceOffsetDelta;
@@ -103,4 +112,38 @@ export function getAuctionPriceForOracleOffsetAuction(
 	}
 
 	return oraclePrice.add(priceOffset);
+}
+
+export function deriveOracleAuctionParams({
+	direction,
+	oraclePrice,
+	auctionStartPrice,
+	auctionEndPrice,
+	limitPrice,
+}: {
+	direction: PositionDirection;
+	oraclePrice: BN;
+	auctionStartPrice: BN;
+	auctionEndPrice: BN;
+	limitPrice: BN;
+}): { auctionStartPrice: BN; auctionEndPrice: BN; oraclePriceOffset: number } {
+	let oraclePriceOffset = limitPrice.sub(oraclePrice);
+	if (oraclePriceOffset.eq(ZERO)) {
+		oraclePriceOffset = isVariant(direction, 'long')
+			? auctionEndPrice.sub(oraclePrice).add(ONE)
+			: auctionEndPrice.sub(oraclePrice).sub(ONE);
+	}
+
+	let oraclePriceOffsetNum;
+	try {
+		oraclePriceOffsetNum = oraclePriceOffset.toNumber();
+	} catch (e) {
+		oraclePriceOffsetNum = 0;
+	}
+
+	return {
+		auctionStartPrice: auctionStartPrice.sub(oraclePrice),
+		auctionEndPrice: auctionEndPrice.sub(oraclePrice),
+		oraclePriceOffset: oraclePriceOffsetNum,
+	};
 }

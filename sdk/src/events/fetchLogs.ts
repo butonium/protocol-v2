@@ -36,7 +36,8 @@ export async function fetchLogs(
 	finality: Finality,
 	beforeTx?: TransactionSignature,
 	untilTx?: TransactionSignature,
-	limit?: number
+	limit?: number,
+	batchSize = 25
 ): Promise<FetchLogsResponse> {
 	const signatures = await connection.getSignaturesForAddress(
 		address,
@@ -60,7 +61,7 @@ export async function fetchLogs(
 		return undefined;
 	}
 
-	const chunkedSignatures = chunk(filteredSignatures, 100);
+	const chunkedSignatures = chunk(filteredSignatures, batchSize);
 
 	const transactionLogs = (
 		await Promise.all(
@@ -116,8 +117,7 @@ export async function fetchTransactionLogs(
 	}
 
 	const logs = new Array<Log>();
-	for (const i in rpcResponses) {
-		const rpcResponse = rpcResponses[i];
+	for (const rpcResponse of rpcResponses) {
 		if (rpcResponse.result) {
 			logs.push(mapTransactionResponseToLog(rpcResponse.result));
 		}
@@ -150,16 +150,22 @@ export class LogParser {
 
 	public parseEventsFromLogs(event: Log): WrappedEvents {
 		const records: WrappedEvents = [];
+
+		if (!event.logs) return records;
+
 		// @ts-ignore
 		const eventGenerator = this.program._events._eventParser.parseLogs(
 			event.logs,
 			false
 		);
+		let runningEventIndex = 0;
 		for (const eventLog of eventGenerator) {
 			eventLog.data.txSig = event.txSig;
 			eventLog.data.slot = event.slot;
 			eventLog.data.eventType = eventLog.name;
+			eventLog.data.txSigIndex = runningEventIndex;
 			records.push(eventLog.data);
+			runningEventIndex++;
 		}
 		return records;
 	}

@@ -5,10 +5,11 @@ import {
 	StateAccount,
 	UserAccount,
 	UserStatsAccount,
+	InsuranceFundStake,
 } from '../types';
 import StrictEventEmitter from 'strict-event-emitter-types';
 import { EventEmitter } from 'events';
-import { PublicKey } from '@solana/web3.js';
+import { Context, PublicKey } from '@solana/web3.js';
 import { Account } from '@solana/spl-token';
 import { OracleInfo, OraclePriceData } from '..';
 
@@ -19,6 +20,13 @@ export interface AccountSubscriber<T> {
 	unsubscribe(): Promise<void>;
 
 	setData(userAccount: T, slot?: number): void;
+}
+
+export interface ProgramAccountSubscriber<T> {
+	subscribe(
+		onChange: (accountId: PublicKey, data: T, context: Context) => void
+	): Promise<void>;
+	unsubscribe(): Promise<void>;
 }
 
 export class NotSubscribedError extends Error {
@@ -33,6 +41,10 @@ export interface DriftClientAccountEvents {
 	userAccountUpdate: (payload: UserAccount) => void;
 	update: void;
 	error: (e: Error) => void;
+}
+
+export interface DriftClientMetricsEvents {
+	txSigned: void;
 }
 
 export interface DriftClientAccountSubscriber {
@@ -96,6 +108,26 @@ export interface TokenAccountSubscriber {
 	unsubscribe(): Promise<void>;
 
 	getTokenAccountAndSlot(): DataAndSlot<Account>;
+}
+
+export interface InsuranceFundStakeAccountSubscriber {
+	eventEmitter: StrictEventEmitter<
+		EventEmitter,
+		InsuranceFundStakeAccountEvents
+	>;
+	isSubscribed: boolean;
+
+	subscribe(): Promise<boolean>;
+	fetch(): Promise<void>;
+	unsubscribe(): Promise<void>;
+
+	getInsuranceFundStakeAccountAndSlot(): DataAndSlot<InsuranceFundStake>;
+}
+
+export interface InsuranceFundStakeAccountEvents {
+	insuranceFundStakeAccountUpdate: (payload: InsuranceFundStake) => void;
+	update: void;
+	error: (e: Error) => void;
 }
 
 export interface OracleEvents {

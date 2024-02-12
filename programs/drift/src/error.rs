@@ -447,7 +447,7 @@ pub enum ErrorCode {
     UnableToGetLimitPrice,
     #[msg("Invalid Liquidation")]
     InvalidLiquidation,
-    #[msg("Spot Fulfullment Config Disabled")]
+    #[msg("Spot Fulfillment Config Disabled")]
     SpotFulfillmentConfigDisabled,
     #[msg("Invalid Maker")]
     InvalidMaker,
@@ -513,6 +513,14 @@ pub enum ErrorCode {
     ImpossibleFill,
     #[msg("CantUpdatePerpBidAskTwap")]
     CantUpdatePerpBidAskTwap,
+    #[msg("UserReduceOnly")]
+    UserReduceOnly,
+    #[msg("InvalidMarginCalculation")]
+    InvalidMarginCalculation,
+    #[msg("CantPayUserInitFee")]
+    CantPayUserInitFee,
+    #[msg("CantReclaimRent")]
+    CantReclaimRent,
 }
 
 #[macro_export]

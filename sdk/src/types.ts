@@ -27,10 +27,25 @@ export class MarketStatus {
 	static readonly DELISTED = { delisted: {} };
 }
 
-export class UserStatus {
-	static readonly ACTIVE = { active: {} };
-	static readonly BEING_LIQUIDATED = { beingLiquidated: {} };
-	static readonly BANKRUPT = { bankrupt: {} };
+export enum PerpOperation {
+	UPDATE_FUNDING = 1,
+	AMM_FILL = 2,
+	FILL = 4,
+	SETTLE_PNL = 8,
+	SETTLE_PNL_WITH_POSITION = 16,
+}
+
+export enum SpotOperation {
+	UPDATE_CUMULATIVE_INTEREST = 1,
+	FILL = 2,
+	WITHDRAW = 4,
+}
+
+export enum UserStatus {
+	BEING_LIQUIDATED = 1,
+	BANKRUPT = 2,
+	REDUCE_ONLY = 4,
+	ADVANCED_LP = 8,
 }
 
 export class ContractType {
@@ -154,8 +169,14 @@ export class OrderActionExplanation {
 	static readonly ORDER_FILLED_WITH_SERUM = {
 		orderFillWithSerum: {},
 	};
+	static readonly ORDER_FILLED_WITH_PHOENIX = {
+		orderFillWithPhoenix: {},
+	};
 	static readonly REDUCE_ONLY_ORDER_INCREASED_POSITION = {
 		reduceOnlyOrderIncreasedPosition: {},
+	};
+	static readonly DERISK_LP = {
+		deriskLp: {},
 	};
 }
 
@@ -179,6 +200,8 @@ export class SpotFulfillmentStatus {
 export class DepositExplanation {
 	static readonly NONE = { none: {} };
 	static readonly TRANSFER = { transfer: {} };
+	static readonly BORROW = { borrow: {} };
+	static readonly REPAY_BORROW = { repayBorrow: {} };
 }
 
 export class SettlePnlExplanation {
@@ -196,6 +219,8 @@ export class StakeAction {
 	static readonly UNSTAKE_REQUEST = { unstakeRequest: {} };
 	static readonly UNSTAKE_CANCEL_REQUEST = { unstakeCancelRequest: {} };
 	static readonly UNSTAKE = { unstake: {} };
+	static readonly UNSTAKE_TRANSFER = { unstakeTransfer: {} };
+	static readonly STAKE_TRANSFER = { stakeTransfer: {} };
 }
 
 export function isVariant(object: unknown, type: string) {
@@ -337,6 +362,7 @@ export class LPAction {
 	static readonly ADD_LIQUIDITY = { addLiquidity: {} };
 	static readonly REMOVE_LIQUIDITY = { removeLiquidity: {} };
 	static readonly SETTLE_LIQUIDITY = { settleLiquidity: {} };
+	static readonly REMOVE_LIQUIDITY_DERISK = { removeLiquidityDerisk: {} };
 }
 
 export type FundingRateRecord = {
@@ -538,6 +564,7 @@ export type StateAccount = {
 	defaultSpotAuctionDuration: number;
 	liquidationMarginBufferRatio: number;
 	settlementDuration: number;
+	maxNumberOfSubAccounts: number;
 	signer: PublicKey;
 	signerNonce: number;
 	srmVault: PublicKey;
@@ -546,6 +573,7 @@ export type StateAccount = {
 	lpCooldownTime: BN;
 	initialPctToLiquidate: number;
 	liquidationDuration: number;
+	maxInitializeUserFee: number;
 };
 
 export type PerpMarketAccount = {
@@ -581,6 +609,8 @@ export type PerpMarketAccount = {
 		quoteMaxInsurance: BN;
 	};
 	quoteSpotMarketIndex: number;
+	feeAdjustment: number;
+	pausedOperations: number;
 };
 
 export type HistoricalOracleData = {
@@ -651,6 +681,7 @@ export type SpotMarketAccount = {
 	maintenanceLiabilityWeight: number;
 	liquidatorFee: number;
 	imfFactor: number;
+	scaleInitialAssetWeightStart: BN;
 
 	withdrawGuardThreshold: BN;
 	depositTokenTwap: BN;
@@ -671,6 +702,8 @@ export type SpotMarketAccount = {
 	flashLoanInitialTokenAmount: BN;
 
 	ordersEnabled: boolean;
+
+	pausedOperations: number;
 };
 
 export type PoolBalance = {
@@ -701,7 +734,7 @@ export type AMM = {
 	pegMultiplier: BN;
 	cumulativeFundingRateLong: BN;
 	cumulativeFundingRateShort: BN;
-	last24hAvgFundingRate: BN;
+	last24HAvgFundingRate: BN;
 	lastFundingRateShort: BN;
 	lastFundingRateLong: BN;
 
@@ -766,6 +799,8 @@ export type AMM = {
 	bidQuoteAssetReserve: BN;
 	askBaseAssetReserve: BN;
 	askQuoteAssetReserve: BN;
+
+	perLpBase: number; // i8
 };
 
 // # User Account Types
@@ -784,6 +819,7 @@ export type PerpPosition = {
 	remainderBaseAssetAmount: number;
 	lastBaseAssetAmountPerLp: BN;
 	lastQuoteAssetAmountPerLp: BN;
+	perLpBase: number;
 };
 
 export type UserStatsAccount = {
@@ -817,7 +853,7 @@ export type UserAccount = {
 	spotPositions: SpotPosition[];
 	perpPositions: PerpPosition[];
 	orders: Order[];
-	status: UserStatus;
+	status: number;
 	nextLiquidationId: number;
 	nextOrderId: number;
 	maxMarginRatio: number;
@@ -858,8 +894,8 @@ export type Order = {
 	marketIndex: number;
 	price: BN;
 	baseAssetAmount: BN;
-	baseAssetAmountFilled: BN;
 	quoteAssetAmount: BN;
+	baseAssetAmountFilled: BN;
 	quoteAssetAmountFilled: BN;
 	direction: PositionDirection;
 	reduceOnly: boolean;
@@ -989,8 +1025,6 @@ export interface IVersionedWallet {
 
 export type FeeStructure = {
 	feeTiers: FeeTier[];
-	makerRebateNumerator: BN;
-	makerRebateDenominator: BN;
 	fillerRewardStructure: OrderFillerRewardStructure;
 	flatFillerFee: BN;
 	referrerRewardEpochUpperBound: BN;
@@ -1098,4 +1132,19 @@ export type PerpMarketExtendedInfo = {
 	 */
 	pnlPoolValue: BN;
 	contractTier: ContractTier;
+};
+
+export type HealthComponents = {
+	deposits: HealthComponent[];
+	borrows: HealthComponent[];
+	perpPositions: HealthComponent[];
+	perpPnl: HealthComponent[];
+};
+
+export type HealthComponent = {
+	marketIndex: number;
+	size: BN;
+	value: BN;
+	weight: BN;
+	weightedValue: BN;
 };

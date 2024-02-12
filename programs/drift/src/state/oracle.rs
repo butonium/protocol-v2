@@ -1,11 +1,12 @@
 use anchor_lang::prelude::*;
 
-use crate::error::DriftResult;
+use crate::error::{DriftResult, ErrorCode};
 use crate::math::casting::Cast;
 use crate::math::constants::{PRICE_PRECISION, PRICE_PRECISION_I64, PRICE_PRECISION_U64};
 use crate::math::safe_math::SafeMath;
 
 use crate::math::safe_unwrap::SafeUnwrap;
+use crate::validate;
 
 #[cfg(test)]
 mod tests;
@@ -168,6 +169,9 @@ pub fn get_pyth_price(
     let oracle_price = price_data.agg.price;
     let oracle_conf = price_data.agg.conf;
 
+    let min_publishers = price_data.num.min(3);
+    let publisher_count = price_data.num_qt;
+
     let oracle_precision = 10_u128.pow(price_data.expo.unsigned_abs());
 
     if oracle_precision <= multiple {
@@ -206,7 +210,7 @@ pub fn get_pyth_price(
         price: oracle_price_scaled,
         confidence: oracle_conf_scaled,
         delay: oracle_delay,
-        has_sufficient_number_of_data_points: true,
+        has_sufficient_number_of_data_points: publisher_count >= min_publishers,
     })
 }
 
@@ -267,3 +271,62 @@ pub fn get_pyth_stable_coin_price(
 //         has_sufficient_number_of_data_points,
 //     })
 // }
+
+#[derive(Clone, Copy)]
+pub struct StrictOraclePrice {
+    pub current: i64,
+    pub twap_5min: Option<i64>,
+}
+
+impl StrictOraclePrice {
+    pub fn new(price: i64, twap_5min: i64, enabled: bool) -> Self {
+        Self {
+            current: price,
+            twap_5min: if enabled { Some(twap_5min) } else { None },
+        }
+    }
+
+    pub fn max(&self) -> i64 {
+        match self.twap_5min {
+            Some(twap) => self.current.max(twap),
+            None => self.current,
+        }
+    }
+
+    pub fn min(&self) -> i64 {
+        match self.twap_5min {
+            Some(twap) => self.current.min(twap),
+            None => self.current,
+        }
+    }
+
+    pub fn validate(&self) -> DriftResult {
+        validate!(
+            self.current > 0,
+            ErrorCode::InvalidOracle,
+            "oracle_price_data={} (<= 0)",
+            self.current,
+        )?;
+
+        if let Some(twap) = self.twap_5min {
+            validate!(
+                twap > 0,
+                ErrorCode::InvalidOracle,
+                "oracle_price_twap={} (<= 0)",
+                twap
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl StrictOraclePrice {
+    pub fn test(price: i64) -> Self {
+        Self {
+            current: price,
+            twap_5min: None,
+        }
+    }
+}

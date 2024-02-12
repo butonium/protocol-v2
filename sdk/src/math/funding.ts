@@ -5,11 +5,13 @@ import {
 	QUOTE_PRECISION,
 	ZERO,
 	ONE,
+	FUNDING_RATE_OFFSET_DENOMINATOR,
 } from '../constants/numericConstants';
 import { PerpMarketAccount, isVariant } from '../types';
 import { OraclePriceData } from '../oracles/types';
 import { calculateBidAskPrice } from './amm';
 import { calculateLiveOracleTwap } from './oracles';
+import { clampBN } from './utils';
 
 function calculateLiveMarkTwap(
 	market: PerpMarketAccount,
@@ -156,7 +158,18 @@ export async function calculateAllEstimatedFundingRate(
 	// }
 
 	const twapSpread = markTwap.sub(oracleTwap);
-	const twapSpreadPct = twapSpread
+	const twapSpreadWithOffset = twapSpread.add(
+		oracleTwap.abs().div(FUNDING_RATE_OFFSET_DENOMINATOR)
+	);
+	const maxSpread = getMaxPriceDivergenceForFundingRate(market, oracleTwap);
+
+	const clampedSpreadWithOffset = clampBN(
+		twapSpreadWithOffset,
+		maxSpread.mul(new BN(-1)),
+		maxSpread
+	);
+
+	const twapSpreadPct = clampedSpreadWithOffset
 		.mul(PRICE_PRECISION)
 		.mul(new BN(100))
 		.div(oracleTwap);
@@ -227,6 +240,25 @@ export async function calculateAllEstimatedFundingRate(
 	}
 
 	return [markTwap, oracleTwap, lowerboundEst, cappedAltEst, interpEst];
+}
+
+function getMaxPriceDivergenceForFundingRate(
+	market: PerpMarketAccount,
+	oracleTwap: BN
+) {
+	if (isVariant(market.contractTier, 'a')) {
+		return oracleTwap.divn(33);
+	} else if (isVariant(market.contractTier, 'b')) {
+		return oracleTwap.divn(33);
+	} else if (isVariant(market.contractTier, 'c')) {
+		return oracleTwap.divn(20);
+	} else if (isVariant(market.contractTier, 'speculative')) {
+		return oracleTwap.divn(10);
+	} else if (isVariant(market.contractTier, 'isolated')) {
+		return oracleTwap.divn(10);
+	} else {
+		return oracleTwap.divn(10);
+	}
 }
 
 /**

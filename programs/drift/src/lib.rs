@@ -11,6 +11,7 @@ use math::{bn, constants::*};
 use state::oracle::OracleSource;
 
 use crate::controller::position::PositionDirection;
+use crate::state::order_params::{ModifyOrderParams, OrderParams};
 use crate::state::perp_market::{ContractTier, MarketStatus};
 use crate::state::spot_market::AssetTier;
 use crate::state::spot_market::SpotFulfillmentConfigStatus;
@@ -261,8 +262,28 @@ pub mod drift {
         handle_update_user_delegate(ctx, _sub_account_id, delegate)
     }
 
+    pub fn update_user_reduce_only(
+        ctx: Context<UpdateUser>,
+        _sub_account_id: u16,
+        reduce_only: bool,
+    ) -> Result<()> {
+        handle_update_user_reduce_only(ctx, _sub_account_id, reduce_only)
+    }
+
+    pub fn update_user_advanced_lp(
+        ctx: Context<UpdateUser>,
+        _sub_account_id: u16,
+        advanced_lp: bool,
+    ) -> Result<()> {
+        handle_update_user_advanced_lp(ctx, _sub_account_id, advanced_lp)
+    }
+
     pub fn delete_user(ctx: Context<DeleteUser>) -> Result<()> {
         handle_delete_user(ctx)
+    }
+
+    pub fn reclaim_rent(ctx: Context<ReclaimRent>) -> Result<()> {
+        handle_reclaim_rent(ctx)
     }
 
     // Keeper Instructions
@@ -489,6 +510,14 @@ pub mod drift {
         handle_remove_insurance_fund_stake(ctx, market_index)
     }
 
+    pub fn transfer_protocol_if_shares(
+        ctx: Context<TransferProtocolIfShares>,
+        market_index: u16,
+        shares: u128,
+    ) -> Result<()> {
+        handle_transfer_protocol_if_shares(ctx, market_index, shares)
+    }
+
     // Admin Instructions
 
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
@@ -603,6 +632,14 @@ pub mod drift {
         sqrt_k: u128,
     ) -> Result<()> {
         handle_move_amm_price(ctx, base_asset_reserve, quote_asset_reserve, sqrt_k)
+    }
+
+    pub fn recenter_perp_market_amm(
+        ctx: Context<AdminUpdatePerpMarket>,
+        peg_multiplier: u128,
+        sqrt_k: u128,
+    ) -> Result<()> {
+        handle_recenter_perp_market_amm(ctx, peg_multiplier, sqrt_k)
     }
 
     pub fn update_perp_market_expiry(
@@ -723,6 +760,13 @@ pub mod drift {
         handle_update_spot_market_status(ctx, status)
     }
 
+    pub fn update_spot_market_paused_operations(
+        ctx: Context<AdminUpdateSpotMarket>,
+        paused_operations: u8,
+    ) -> Result<()> {
+        handle_update_spot_market_paused_operations(ctx, paused_operations)
+    }
+
     pub fn update_spot_market_asset_tier(
         ctx: Context<AdminUpdateSpotMarket>,
         asset_tier: AssetTier,
@@ -769,6 +813,16 @@ pub mod drift {
         handle_update_spot_market_max_token_deposits(ctx, max_token_deposits)
     }
 
+    pub fn update_spot_market_scale_initial_asset_weight_start(
+        ctx: Context<AdminUpdateSpotMarket>,
+        scale_initial_asset_weight_start: u64,
+    ) -> Result<()> {
+        handle_update_spot_market_scale_initial_asset_weight_start(
+            ctx,
+            scale_initial_asset_weight_start,
+        )
+    }
+
     pub fn update_spot_market_oracle(
         ctx: Context<AdminUpdateSpotMarketOracle>,
         oracle: Pubkey,
@@ -811,6 +865,13 @@ pub mod drift {
         status: MarketStatus,
     ) -> Result<()> {
         handle_update_perp_market_status(ctx, status)
+    }
+
+    pub fn update_perp_market_paused_operations(
+        ctx: Context<AdminUpdatePerpMarket>,
+        paused_operations: u8,
+    ) -> Result<()> {
+        handle_update_perp_market_paused_operations(ctx, paused_operations)
     }
 
     pub fn update_perp_market_contract_tier(
@@ -864,6 +925,13 @@ pub mod drift {
         )
     }
 
+    pub fn update_perp_market_per_lp_base(
+        ctx: Context<AdminUpdatePerpMarket>,
+        per_lp_base: i8,
+    ) -> Result<()> {
+        handle_update_perp_market_per_lp_base(ctx, per_lp_base)
+    }
+
     pub fn update_lp_cooldown_time(
         ctx: Context<AdminUpdateState>,
         lp_cooldown_time: u64,
@@ -899,6 +967,13 @@ pub mod drift {
         handle_update_liquidation_duration(ctx, liquidation_duration)
     }
 
+    pub fn update_liquidation_margin_buffer_ratio(
+        ctx: Context<AdminUpdateState>,
+        liquidation_margin_buffer_ratio: u32,
+    ) -> Result<()> {
+        handle_update_liquidation_margin_buffer_ratio(ctx, liquidation_margin_buffer_ratio)
+    }
+
     pub fn update_oracle_guard_rails(
         ctx: Context<AdminUpdateState>,
         oracle_guard_rails: OracleGuardRails,
@@ -911,6 +986,20 @@ pub mod drift {
         settlement_duration: u16,
     ) -> Result<()> {
         handle_update_state_settlement_duration(ctx, settlement_duration)
+    }
+
+    pub fn update_state_max_number_of_sub_accounts(
+        ctx: Context<AdminUpdateState>,
+        max_number_of_sub_accounts: u16,
+    ) -> Result<()> {
+        handle_update_state_max_number_of_sub_accounts(ctx, max_number_of_sub_accounts)
+    }
+
+    pub fn update_state_max_initialize_user_fee(
+        ctx: Context<AdminUpdateState>,
+        max_initialize_user_fee: u16,
+    ) -> Result<()> {
+        handle_update_state_max_initialize_user_fee(ctx, max_initialize_user_fee)
     }
 
     pub fn update_perp_market_oracle(
@@ -985,6 +1074,13 @@ pub mod drift {
         handle_update_perp_market_max_open_interest(ctx, max_open_interest)
     }
 
+    pub fn update_perp_market_fee_adjustment(
+        ctx: Context<AdminUpdatePerpMarket>,
+        fee_adjustment: i16,
+    ) -> Result<()> {
+        handle_update_perp_market_fee_adjustment(ctx, fee_adjustment)
+    }
+
     pub fn update_admin(ctx: Context<AdminUpdateState>, admin: Pubkey) -> Result<()> {
         handle_update_admin(ctx, admin)
     }
@@ -1030,6 +1126,24 @@ pub mod drift {
         amount: u64,
     ) -> Result<()> {
         handle_admin_remove_insurance_fund_stake(ctx, market_index, amount)
+    }
+
+    pub fn initialize_protocol_if_shares_transfer_config(
+        ctx: Context<InitializeProtocolIfSharesTransferConfig>,
+    ) -> Result<()> {
+        handle_initialize_protocol_if_shares_transfer_config(ctx)
+    }
+
+    pub fn update_protocol_if_shares_transfer_config(
+        ctx: Context<UpdateProtocolIfSharesTransferConfig>,
+        whitelisted_signers: Option<[Pubkey; 4]>,
+        max_transfer_per_epoch: Option<u128>,
+    ) -> Result<()> {
+        handle_update_protocol_if_shares_transfer_config(
+            ctx,
+            whitelisted_signers,
+            max_transfer_per_epoch,
+        )
     }
 }
 

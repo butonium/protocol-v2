@@ -169,6 +169,7 @@ mod calculate_auction_price {
     use crate::math::auction::calculate_auction_price;
     use crate::math::constants::{PRICE_PRECISION_I64, PRICE_PRECISION_U64};
     use crate::state::user::{Order, OrderType};
+    use crate::PositionDirection;
 
     #[test]
     fn long_oracle_order() {
@@ -329,5 +330,141 @@ mod calculate_auction_price {
         let price = calculate_auction_price(&order, slot, tick_size, oracle_price).unwrap();
 
         assert_eq!(price, 8 * PRICE_PRECISION_U64 / 10);
+    }
+
+    #[test]
+    fn same_auction_start_and_end() {
+        let tick_size = 1;
+        let mut order = Order {
+            order_type: OrderType::Market,
+            direction: PositionDirection::Long,
+            auction_duration: 10,
+            slot: 0,
+            auction_start_price: PRICE_PRECISION_I64,
+            auction_end_price: PRICE_PRECISION_I64,
+            ..Order::default()
+        };
+
+        let slot = 5;
+        let price = calculate_auction_price(&order, slot, tick_size, None).unwrap();
+        assert_eq!(price, PRICE_PRECISION_U64);
+
+        order.direction = PositionDirection::Short;
+        let price = calculate_auction_price(&order, slot, tick_size, None).unwrap();
+        assert_eq!(price, PRICE_PRECISION_U64);
+
+        let mut order = Order {
+            order_type: OrderType::Oracle,
+            direction: PositionDirection::Long,
+            auction_duration: 10,
+            slot: 0,
+            auction_start_price: PRICE_PRECISION_I64 / 2,
+            auction_end_price: PRICE_PRECISION_I64 / 2,
+            ..Order::default()
+        };
+        let oracle_price = Some(PRICE_PRECISION_I64);
+        let price = calculate_auction_price(&order, slot, tick_size, oracle_price).unwrap();
+        assert_eq!(price, 3 * PRICE_PRECISION_U64 / 2);
+
+        order.direction = PositionDirection::Short;
+        let price = calculate_auction_price(&order, slot, tick_size, oracle_price).unwrap();
+        assert_eq!(price, 3 * PRICE_PRECISION_U64 / 2);
+    }
+}
+
+mod calculate_auction_params_for_trigger_order {
+    use crate::math::auction::calculate_auction_params_for_trigger_order;
+    use crate::state::oracle::OraclePriceData;
+    use crate::state::user::{Order, OrderType};
+    use crate::{PositionDirection, PRICE_PRECISION_I64, PRICE_PRECISION_U64};
+
+    #[test]
+    fn trigger_limit() {
+        let mut order = Order {
+            order_type: OrderType::TriggerLimit,
+            direction: PositionDirection::Long,
+            trigger_price: 100 * PRICE_PRECISION_U64,
+            price: 90 * PRICE_PRECISION_U64,
+            ..Order::default()
+        };
+        let oracle_price_data = OraclePriceData {
+            price: 100 * PRICE_PRECISION_I64,
+            ..OraclePriceData::default()
+        };
+        let min_auction_duration = 10;
+
+        order.direction = PositionDirection::Long;
+        order.price = 110 * PRICE_PRECISION_U64;
+
+        let (auction_duration, auction_start_price, auction_end_price) =
+            calculate_auction_params_for_trigger_order(
+                &order,
+                &oracle_price_data,
+                min_auction_duration,
+                None,
+            )
+            .unwrap();
+        assert_eq!(auction_duration, 10);
+        assert_eq!(auction_start_price, 100000000);
+        assert_eq!(auction_end_price, 100500000);
+
+        order.direction = PositionDirection::Short;
+        order.price = 90 * PRICE_PRECISION_U64;
+
+        let (auction_duration, auction_start_price, auction_end_price) =
+            calculate_auction_params_for_trigger_order(
+                &order,
+                &oracle_price_data,
+                min_auction_duration,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(auction_duration, 10);
+        assert_eq!(auction_start_price, 100000000);
+        assert_eq!(auction_end_price, 99500000);
+    }
+
+    #[test]
+    fn trigger_market() {
+        let mut order = Order {
+            order_type: OrderType::TriggerMarket,
+            direction: PositionDirection::Long,
+            trigger_price: 100 * PRICE_PRECISION_U64,
+            ..Order::default()
+        };
+        let oracle_price_data = OraclePriceData {
+            price: 100 * PRICE_PRECISION_I64,
+            ..OraclePriceData::default()
+        };
+        let min_auction_duration = 10;
+
+        let (auction_duration, auction_start_price, auction_end_price) =
+            calculate_auction_params_for_trigger_order(
+                &order,
+                &oracle_price_data,
+                min_auction_duration,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(auction_duration, 10);
+        assert_eq!(auction_start_price, 100000000);
+        assert_eq!(auction_end_price, 100500000);
+
+        order.direction = PositionDirection::Short;
+
+        let (auction_duration, auction_start_price, auction_end_price) =
+            calculate_auction_params_for_trigger_order(
+                &order,
+                &oracle_price_data,
+                min_auction_duration,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(auction_duration, 10);
+        assert_eq!(auction_start_price, 100000000);
+        assert_eq!(auction_end_price, 99500000);
     }
 }

@@ -33,7 +33,7 @@ import {
 	initializeSolSpotMarket,
 	sleep,
 } from './testHelpers';
-import { BulkAccountLoader } from '../sdk';
+import { BulkAccountLoader, PERCENTAGE_PRECISION } from '../sdk';
 
 describe('liquidate spot', () => {
 	const provider = anchor.AnchorProvider.local(undefined, {
@@ -107,6 +107,13 @@ describe('liquidate spot', () => {
 		await initializeQuoteSpotMarket(driftClient, usdcMint.publicKey);
 		await initializeSolSpotMarket(driftClient, solOracle);
 
+		const oracleGuardrails = await driftClient.getStateAccount()
+			.oracleGuardRails;
+		oracleGuardrails.priceDivergence.oracleTwap5MinPercentDivergence = new BN(
+			100
+		).mul(PERCENTAGE_PRECISION);
+		await driftClient.updateOracleGuardRails(oracleGuardrails);
+
 		await driftClient.initializeUserAccountAndDepositCollateral(
 			usdcAmount,
 			userUSDCAccount.publicKey
@@ -156,7 +163,7 @@ describe('liquidate spot', () => {
 		await driftClient.fetchAccounts();
 		const healthBefore100 = user.getHealth();
 		console.log('healthBefore100:', healthBefore100);
-		assert(healthBefore100 == 83);
+		assert(healthBefore100 == 45);
 
 		console.log(
 			'spotLiquidationPrice:',
@@ -172,7 +179,7 @@ describe('liquidate spot', () => {
 		await user.fetchAccounts();
 		const healthBefore179 = user.getHealth();
 		console.log('healthBefore179:', healthBefore179);
-		assert(healthBefore179 == 20);
+		assert(healthBefore179 == 2);
 		console.log(
 			'spotLiquidationPrice:',
 			convertToNumber(
@@ -208,7 +215,7 @@ describe('liquidate spot', () => {
 
 		const healthBefore181 = user.getHealth();
 		console.log('healthBefore181:', healthBefore181);
-		assert(healthBefore181 == 0.02);
+		assert(healthBefore181 == 0);
 		console.log(
 			'spotLiquidationPrice:',
 			convertToNumber(
@@ -252,7 +259,7 @@ describe('liquidate spot', () => {
 		);
 
 		// assert(!driftClient.getUserAccount().isBeingLiquidated); // out of liq territory
-		assert(!isVariant(driftClient.getUserAccount().status, 'beingLiquidated'));
+		assert(driftClient.getUserAccount().status === 0);
 
 		assert(driftClient.getUserAccount().nextLiquidationId === 2);
 		assert(

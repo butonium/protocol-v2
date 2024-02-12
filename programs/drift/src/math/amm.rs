@@ -8,7 +8,7 @@ use crate::error::{DriftResult, ErrorCode};
 use crate::math::bn::U192;
 use crate::math::casting::Cast;
 use crate::math::constants::{
-    BID_ASK_SPREAD_PRECISION, BID_ASK_SPREAD_PRECISION_I128, CONCENTRATION_PRECISION,
+    BID_ASK_SPREAD_PRECISION_I128, CONCENTRATION_PRECISION,
     DEFAULT_MAX_TWAP_UPDATE_PRICE_BAND_DENOMINATOR, FIVE_MINUTE, ONE_HOUR, ONE_MINUTE,
     PRICE_TIMES_AMM_TO_QUOTE_PRECISION_RATIO, PRICE_TIMES_AMM_TO_QUOTE_PRECISION_RATIO_I128,
     PRICE_TO_PEG_PRECISION_RATIO, QUOTE_PRECISION_I64,
@@ -60,26 +60,6 @@ pub fn calculate_bid_ask_bounds(
         get_proportion_u128(sqrt_k, CONCENTRATION_PRECISION, concentration_coef)?;
 
     Ok((bid_bounded_base, ask_bounded_base))
-}
-
-pub fn calculate_terminal_price(amm: &mut AMM) -> DriftResult<u64> {
-    let swap_direction = if amm.base_asset_amount_with_amm > 0 {
-        SwapDirection::Add
-    } else {
-        SwapDirection::Remove
-    };
-    let (new_quote_asset_amount, new_base_asset_amount) = calculate_swap_output(
-        amm.base_asset_amount_with_amm.unsigned_abs(),
-        amm.base_asset_reserve,
-        swap_direction,
-        amm.sqrt_k,
-    )?;
-
-    calculate_price(
-        new_quote_asset_amount,
-        new_base_asset_amount,
-        amm.peg_multiplier,
-    )
 }
 
 pub fn calculate_market_open_bids_asks(amm: &AMM) -> DriftResult<(i128, i128)> {
@@ -448,10 +428,11 @@ pub fn update_oracle_price_twap(
 
         amm.last_oracle_normalised_price = capped_oracle_update_price;
         amm.historical_oracle_data.last_oracle_price = oracle_price_data.price;
-        amm.last_oracle_conf_pct = oracle_price_data
-            .confidence
-            .safe_mul(BID_ASK_SPREAD_PRECISION)?
-            .safe_div(reserve_price)? as u64;
+
+        // use decayed last_oracle_conf_pct as lower bound
+        amm.last_oracle_conf_pct =
+            amm.get_new_oracle_conf_pct(oracle_price_data.confidence, reserve_price, now)?;
+
         amm.historical_oracle_data.last_oracle_delay = oracle_price_data.delay;
         amm.last_oracle_reserve_price_spread_pct =
             calculate_oracle_reserve_price_spread_pct(amm, oracle_price_data, Some(reserve_price))?;
@@ -653,7 +634,6 @@ pub fn calculate_quote_asset_amount_swapped(
 ) -> DriftResult<u128> {
     let mut quote_asset_reserve_change = match swap_direction {
         SwapDirection::Add => quote_asset_reserve_before.safe_sub(quote_asset_reserve_after)?,
-
         SwapDirection::Remove => quote_asset_reserve_after.safe_sub(quote_asset_reserve_before)?,
     };
 

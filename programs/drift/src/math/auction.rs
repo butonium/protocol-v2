@@ -8,6 +8,8 @@ use crate::state::oracle::OraclePriceData;
 use crate::state::user::{Order, OrderType};
 use solana_program::msg;
 
+use crate::state::perp_market::PerpMarket;
+use crate::OrderParams;
 use std::cmp::min;
 
 #[cfg(test)]
@@ -85,7 +87,10 @@ pub fn calculate_auction_price(
     valid_oracle_price: Option<i64>,
 ) -> DriftResult<u64> {
     match order.order_type {
-        OrderType::Market | OrderType::TriggerMarket | OrderType::Limit => {
+        OrderType::Market
+        | OrderType::TriggerMarket
+        | OrderType::Limit
+        | OrderType::TriggerLimit => {
             calculate_auction_price_for_fixed_auction(order, slot, tick_size)
         }
         OrderType::Oracle => calculate_auction_price_for_oracle_offset_auction(
@@ -94,7 +99,6 @@ pub fn calculate_auction_price(
             tick_size,
             valid_oracle_price,
         ),
-        _ => unreachable!(),
     }
 }
 
@@ -194,24 +198,6 @@ fn calculate_auction_price_for_oracle_offset_auction(
     Ok(price)
 }
 
-pub fn does_auction_satisfy_maker_order(
-    maker_order: &Order,
-    taker_order: &Order,
-    auction_price: u64,
-) -> bool {
-    // TODO more conditions to check?
-    if maker_order.direction == taker_order.direction
-        || maker_order.market_index != taker_order.market_index
-    {
-        return false;
-    }
-
-    match maker_order.direction {
-        PositionDirection::Long => auction_price <= maker_order.price,
-        PositionDirection::Short => auction_price >= maker_order.price,
-    }
-}
-
 pub fn is_auction_complete(order_slot: u64, auction_duration: u8, slot: u64) -> DriftResult<bool> {
     if auction_duration == 0 {
         return Ok(true);
@@ -228,4 +214,32 @@ pub fn is_amm_available_liquidity_source(
     slot: u64,
 ) -> DriftResult<bool> {
     is_auction_complete(order.slot, min_auction_duration, slot)
+}
+
+pub fn calculate_auction_params_for_trigger_order(
+    order: &Order,
+    oracle_price_data: &OraclePriceData,
+    min_auction_duration: u8,
+    perp_market: Option<&PerpMarket>,
+) -> DriftResult<(u8, i64, i64)> {
+    let auction_duration = min_auction_duration;
+
+    if let Some(perp_market) = perp_market {
+        let (auction_start_price, auction_end_price, derived_auction_duration) =
+            OrderParams::derive_market_order_auction_params(
+                perp_market,
+                order.direction,
+                oracle_price_data.price,
+                order.price,
+            )?;
+
+        let auction_duration = auction_duration.max(derived_auction_duration);
+
+        Ok((auction_duration, auction_start_price, auction_end_price))
+    } else {
+        let (auction_start_price, auction_end_price) =
+            calculate_auction_prices(oracle_price_data, order.direction, order.price)?;
+
+        Ok((auction_duration, auction_start_price, auction_end_price))
+    }
 }

@@ -1,3 +1,4 @@
+use crate::controller::lp::apply_lp_rebase_to_perp_position;
 use crate::controller::position::{add_new_position, get_position_index, PositionDirection};
 use crate::error::{DriftResult, ErrorCode};
 use crate::math::auction::{calculate_auction_price, is_auction_complete};
@@ -8,26 +9,30 @@ use crate::math::constants::{
     QUOTE_SPOT_MARKET_INDEX, THIRTY_DAY,
 };
 use crate::math::lp::{calculate_lp_open_bids_asks, calculate_settle_lp_metrics};
+use crate::math::margin::MarginRequirementType;
 use crate::math::orders::{standardize_base_asset_amount, standardize_price};
 use crate::math::position::{
     calculate_base_asset_value_and_pnl_with_oracle_price,
     calculate_base_asset_value_with_oracle_price,
 };
 use crate::math::safe_math::SafeMath;
-use crate::math::spot_balance::{get_signed_token_amount, get_token_amount, get_token_value};
+use crate::math::spot_balance::{
+    get_signed_token_amount, get_strict_token_value, get_token_amount, get_token_value,
+};
 use crate::math::stats::calculate_rolling_sum;
-use crate::math_error;
-use crate::safe_increment;
-use crate::state::oracle::OraclePriceData;
+use crate::state::oracle::StrictOraclePrice;
 use crate::state::perp_market::PerpMarket;
 use crate::state::spot_market::{SpotBalance, SpotBalanceType, SpotMarket};
 use crate::state::traits::Size;
 use crate::validate;
 use crate::{get_then_update_id, QUOTE_PRECISION_U64};
+use crate::{math_error, SPOT_WEIGHT_PRECISION_I128};
+use crate::{safe_increment, SPOT_WEIGHT_PRECISION};
 use anchor_lang::prelude::*;
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::msg;
 use std::cmp::max;
+use std::ops::Neg;
 use std::panic::Location;
 
 #[cfg(test)]
@@ -35,15 +40,11 @@ mod tests;
 
 #[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq)]
 pub enum UserStatus {
-    Active,
-    BeingLiquidated,
-    Bankrupt,
-}
-
-impl Default for UserStatus {
-    fn default() -> Self {
-        UserStatus::Active
-    }
+    // Active = 0
+    BeingLiquidated = 0b00000001,
+    Bankrupt = 0b00000010,
+    ReduceOnly = 0b00000100,
+    AdvancedLp = 0b00001000,
 }
 
 // implement SIZE const for User
@@ -51,7 +52,7 @@ impl Size for User {
     const SIZE: usize = 4376;
 }
 
-#[account(zero_copy)]
+#[account(zero_copy(unsafe))]
 #[derive(Default, Eq, PartialEq, Debug, AnchorDeserialize)]
 #[repr(C)]
 pub struct User {
@@ -102,7 +103,7 @@ pub struct User {
     /// The sub account id for this user
     pub sub_account_id: u16,
     /// Whether the user is active, being liquidated or bankrupt
-    pub status: UserStatus,
+    pub status: u8,
     /// Whether the user has enabled margin trading
     pub is_margin_trading_enabled: bool,
     /// User is idle if they haven't interacted with the protocol in 1 week and they have no orders, perp positions or borrows
@@ -121,14 +122,27 @@ pub struct User {
 
 impl User {
     pub fn is_being_liquidated(&self) -> bool {
-        matches!(
-            self.status,
-            UserStatus::BeingLiquidated | UserStatus::Bankrupt
-        )
+        self.status & (UserStatus::BeingLiquidated as u8 | UserStatus::Bankrupt as u8) > 0
     }
 
     pub fn is_bankrupt(&self) -> bool {
-        self.status == UserStatus::Bankrupt
+        self.status & (UserStatus::Bankrupt as u8) > 0
+    }
+
+    pub fn is_reduce_only(&self) -> bool {
+        self.status & (UserStatus::ReduceOnly as u8) > 0
+    }
+
+    pub fn is_advanced_lp(&self) -> bool {
+        self.status & (UserStatus::AdvancedLp as u8) > 0
+    }
+
+    pub fn add_user_status(&mut self, status: UserStatus) {
+        self.status |= status as u8;
+    }
+
+    pub fn remove_user_status(&mut self, status: UserStatus) {
+        self.status &= !(status as u8);
     }
 
     pub fn get_spot_position_index(&self, market_index: u16) -> DriftResult<usize> {
@@ -307,23 +321,26 @@ impl User {
             return self.next_liquidation_id.safe_sub(1);
         }
 
-        self.status = UserStatus::BeingLiquidated;
+        self.add_user_status(UserStatus::BeingLiquidated);
         self.liquidation_margin_freed = 0;
         self.last_active_slot = slot;
         Ok(get_then_update_id!(self, next_liquidation_id))
     }
 
     pub fn exit_liquidation(&mut self) {
-        self.status = UserStatus::Active;
+        self.remove_user_status(UserStatus::BeingLiquidated);
+        self.remove_user_status(UserStatus::Bankrupt);
         self.liquidation_margin_freed = 0;
     }
 
     pub fn enter_bankruptcy(&mut self) {
-        self.status = UserStatus::Bankrupt;
+        self.remove_user_status(UserStatus::BeingLiquidated);
+        self.add_user_status(UserStatus::Bankrupt);
     }
 
     pub fn exit_bankruptcy(&mut self) {
-        self.status = UserStatus::Active;
+        self.remove_user_status(UserStatus::BeingLiquidated);
+        self.remove_user_status(UserStatus::Bankrupt);
         self.liquidation_margin_freed = 0;
     }
 
@@ -343,9 +360,13 @@ impl User {
         self.open_orders = self.open_orders.saturating_add(1);
         self.has_open_order = self.open_orders > 0;
         if is_auction {
-            self.open_auctions = self.open_auctions.saturating_add(1);
-            self.has_open_auction = self.open_auctions > 0;
+            self.increment_open_auctions();
         }
+    }
+
+    pub fn increment_open_auctions(&mut self) {
+        self.open_auctions = self.open_auctions.saturating_add(1);
+        self.has_open_auction = self.open_auctions > 0;
     }
 
     pub fn decrement_open_orders(&mut self, is_auction: bool) {
@@ -357,16 +378,41 @@ impl User {
         }
     }
 
-    pub fn qualifies_for_withdraw_fee(&self, user_stats: &UserStats) -> bool {
+    pub fn qualifies_for_withdraw_fee(&self, user_stats: &UserStats, slot: u64) -> bool {
+        // only qualifies for user with recent last_active_slot (~25 seconds)
+        if slot.saturating_sub(self.last_active_slot) >= 50 {
+            return false;
+        }
+
         let min_total_withdraws = 10_000_000 * QUOTE_PRECISION_U64; // $10M
 
         // if total withdraws are greater than $10M and user has paid more than %.01 of it in fees
         self.total_withdraws >= min_total_withdraws
             && self.total_withdraws / user_stats.fees.total_fee_paid.max(1) > 10_000
     }
+
+    pub fn update_reduce_only_status(&mut self, reduce_only: bool) -> DriftResult {
+        if reduce_only {
+            self.add_user_status(UserStatus::ReduceOnly);
+        } else {
+            self.remove_user_status(UserStatus::ReduceOnly);
+        }
+
+        Ok(())
+    }
+
+    pub fn update_advanced_lp_status(&mut self, advanced_lp: bool) -> DriftResult {
+        if advanced_lp {
+            self.add_user_status(UserStatus::AdvancedLp);
+        } else {
+            self.remove_user_status(UserStatus::AdvancedLp);
+        }
+
+        Ok(())
+    }
 }
 
-#[zero_copy]
+#[zero_copy(unsafe)]
 #[derive(Default, Eq, PartialEq, Debug)]
 #[repr(C)]
 pub struct UserFees {
@@ -390,7 +436,7 @@ pub struct UserFees {
     pub current_epoch_referrer_reward: u64,
 }
 
-#[zero_copy]
+#[zero_copy(unsafe)]
 #[derive(Default, Eq, PartialEq, Debug, AnchorDeserialize)]
 #[repr(C)]
 pub struct SpotPosition {
@@ -445,6 +491,72 @@ impl SpotBalance for SpotPosition {
     }
 }
 
+#[derive(Clone, Copy, Default, Eq, PartialEq, Debug)]
+pub struct OrderFillSimulation {
+    pub token_amount: i128,
+    pub orders_value: i128,
+    pub token_value: i128,
+    pub weighted_token_value: i128,
+    pub free_collateral_contribution: i128,
+}
+
+impl OrderFillSimulation {
+    pub fn riskier_side(ask: Self, bid: Self) -> Self {
+        if ask.free_collateral_contribution <= bid.free_collateral_contribution {
+            ask
+        } else {
+            bid
+        }
+    }
+
+    pub fn risk_increasing(&self, after: Self) -> bool {
+        after.free_collateral_contribution < self.free_collateral_contribution
+    }
+
+    pub fn apply_user_custom_margin_ratio(
+        mut self,
+        spot_market: &SpotMarket,
+        oracle_price: i64,
+        user_custom_margin_ratio: u32,
+    ) -> DriftResult<Self> {
+        if user_custom_margin_ratio == 0 {
+            return Ok(self);
+        }
+
+        if self.weighted_token_value < 0 {
+            let max_liability_weight = spot_market
+                .get_liability_weight(
+                    self.token_amount.unsigned_abs(),
+                    &MarginRequirementType::Initial,
+                )?
+                .max(user_custom_margin_ratio.safe_add(SPOT_WEIGHT_PRECISION)?);
+
+            self.weighted_token_value = self
+                .token_value
+                .safe_mul(max_liability_weight.cast()?)?
+                .safe_div(SPOT_WEIGHT_PRECISION_I128)?;
+        } else if self.weighted_token_value > 0 {
+            let min_asset_weight = spot_market
+                .get_asset_weight(
+                    self.token_amount.unsigned_abs(),
+                    oracle_price,
+                    &MarginRequirementType::Initial,
+                )?
+                .min(SPOT_WEIGHT_PRECISION.saturating_sub(user_custom_margin_ratio));
+
+            self.weighted_token_value = self
+                .token_value
+                .safe_mul(min_asset_weight.cast()?)?
+                .safe_div(SPOT_WEIGHT_PRECISION_I128)?;
+        }
+
+        self.free_collateral_contribution =
+            self.weighted_token_value.safe_add(self.orders_value)?;
+
+        Ok(self)
+    }
+}
+
 impl SpotPosition {
     pub fn is_available(&self) -> bool {
         self.scaled_balance == 0 && self.open_orders == 0
@@ -471,40 +583,119 @@ impl SpotPosition {
         )
     }
 
-    pub fn get_worst_case_token_amount(
+    pub fn get_worst_case_fill_simulation(
         &self,
         spot_market: &SpotMarket,
-        oracle_price_data: &OraclePriceData,
-        twap_5min: Option<i64>,
+        strict_oracle_price: &StrictOraclePrice,
         token_amount: Option<i128>,
-    ) -> DriftResult<(i128, i128)> {
+        margin_type: MarginRequirementType,
+    ) -> DriftResult<OrderFillSimulation> {
+        let [bid_simulation, ask_simulation] = self.simulate_fills_both_sides(
+            spot_market,
+            strict_oracle_price,
+            token_amount,
+            margin_type,
+        )?;
+
+        Ok(OrderFillSimulation::riskier_side(
+            ask_simulation,
+            bid_simulation,
+        ))
+    }
+
+    pub fn simulate_fills_both_sides(
+        &self,
+        spot_market: &SpotMarket,
+        strict_oracle_price: &StrictOraclePrice,
+        token_amount: Option<i128>,
+        margin_type: MarginRequirementType,
+    ) -> DriftResult<[OrderFillSimulation; 2]> {
         let token_amount = match token_amount {
             Some(token_amount) => token_amount,
             None => self.get_signed_token_amount(spot_market)?,
         };
 
-        let token_amount_all_bids_fill = token_amount.safe_add(self.open_bids as i128)?;
+        let token_value =
+            get_strict_token_value(token_amount, spot_market.decimals, strict_oracle_price)?;
 
-        let token_amount_all_asks_fill = token_amount.safe_add(self.open_asks as i128)?;
+        let calculate_weighted_token_value = |token_amount: i128, token_value: i128| {
+            if token_value > 0 {
+                let asset_weight = spot_market.get_asset_weight(
+                    token_amount.unsigned_abs(),
+                    strict_oracle_price.current,
+                    &margin_type,
+                )?;
 
-        let oracle_price = match twap_5min {
-            Some(twap_5min) => twap_5min.max(oracle_price_data.price),
-            None => oracle_price_data.price,
+                token_value
+                    .safe_mul(asset_weight.cast()?)?
+                    .safe_div(SPOT_WEIGHT_PRECISION_I128)
+            } else if token_value < 0 {
+                let liability_weight =
+                    spot_market.get_liability_weight(token_amount.unsigned_abs(), &margin_type)?;
+
+                token_value
+                    .safe_mul(liability_weight.cast()?)?
+                    .safe_div(SPOT_WEIGHT_PRECISION_I128)
+            } else {
+                Ok(0)
+            }
         };
 
-        if token_amount_all_bids_fill.abs() > token_amount_all_asks_fill.abs() {
-            let worst_case_orders_value =
-                get_token_value(-self.open_bids as i128, spot_market.decimals, oracle_price)?;
-            Ok((token_amount_all_bids_fill, worst_case_orders_value))
-        } else {
-            let worst_case_orders_value =
-                get_token_value(-self.open_asks as i128, spot_market.decimals, oracle_price)?;
-            Ok((token_amount_all_asks_fill, worst_case_orders_value))
+        if self.open_bids == 0 && self.open_asks == 0 {
+            let weighted_token_value = calculate_weighted_token_value(token_amount, token_value)?;
+
+            let calculation = OrderFillSimulation {
+                token_amount,
+                orders_value: 0,
+                token_value,
+                weighted_token_value,
+                free_collateral_contribution: weighted_token_value,
+            };
+
+            return Ok([calculation, calculation]);
         }
+
+        let simulate_side = |strict_oracle_price: &StrictOraclePrice,
+                             token_amount: i128,
+                             open_orders: i128| {
+            let order_value = get_token_value(
+                -open_orders as i128,
+                spot_market.decimals,
+                strict_oracle_price.max(),
+            )?;
+            let token_amount_after_fill = token_amount.safe_add(open_orders)?;
+            let token_value_after_fill = token_value.safe_add(order_value.neg())?;
+
+            let weighted_token_value_after_fill =
+                calculate_weighted_token_value(token_amount_after_fill, token_value_after_fill)?;
+
+            let free_collateral_contribution =
+                weighted_token_value_after_fill.safe_add(order_value)?;
+
+            Ok(OrderFillSimulation {
+                token_amount: token_amount_after_fill,
+                orders_value: order_value,
+                token_value: token_value_after_fill,
+                weighted_token_value: weighted_token_value_after_fill,
+                free_collateral_contribution,
+            })
+        };
+
+        let bid_simulation =
+            simulate_side(strict_oracle_price, token_amount, self.open_bids.cast()?)?;
+
+        let ask_simulation =
+            simulate_side(strict_oracle_price, token_amount, self.open_asks.cast()?)?;
+
+        Ok([bid_simulation, ask_simulation])
+    }
+
+    pub fn is_borrow(&self) -> bool {
+        self.scaled_balance > 0 && self.balance_type == SpotBalanceType::Borrow
     }
 }
 
-#[zero_copy]
+#[zero_copy(unsafe)]
 #[derive(Default, Debug, Eq, PartialEq, AnchorDeserialize)]
 #[repr(C)]
 pub struct PerpPosition {
@@ -555,7 +746,7 @@ pub struct PerpPosition {
     pub market_index: u16,
     /// The number of open orders
     pub open_orders: u8,
-    pub padding: [u8; 1],
+    pub per_lp_base: i8,
 }
 
 impl PerpPosition {
@@ -609,26 +800,30 @@ impl PerpPosition {
         market: &PerpMarket,
         valuation_price: i64,
     ) -> DriftResult<PerpPosition> {
-        if !self.is_lp() {
-            return Ok(*self);
+        let mut settled_position = *self;
+
+        if !settled_position.is_lp() {
+            return Ok(settled_position);
         }
 
+        apply_lp_rebase_to_perp_position(market, &mut settled_position)?;
+
         // compute lp metrics
-        let mut lp_metrics = calculate_settle_lp_metrics(&market.amm, self)?;
+        let mut lp_metrics = calculate_settle_lp_metrics(&market.amm, &settled_position)?;
 
         // compute settled position
-        let base_asset_amount = self
+        let base_asset_amount = settled_position
             .base_asset_amount
             .safe_add(lp_metrics.base_asset_amount.cast()?)?;
 
-        let mut quote_asset_amount = self
+        let mut quote_asset_amount = settled_position
             .quote_asset_amount
             .safe_add(lp_metrics.quote_asset_amount.cast()?)?;
 
-        let mut new_remainder_base_asset_amount =
-            self.remainder_base_asset_amount
-                .cast::<i64>()?
-                .safe_add(lp_metrics.remainder_base_asset_amount.cast()?)?;
+        let mut new_remainder_base_asset_amount = settled_position
+            .remainder_base_asset_amount
+            .cast::<i64>()?
+            .safe_add(lp_metrics.remainder_base_asset_amount.cast()?)?;
 
         if new_remainder_base_asset_amount.unsigned_abs() >= market.amm.order_step_size {
             let (standardized_remainder_base_asset_amount, remainder_base_asset_amount) =
@@ -657,21 +852,18 @@ impl PerpPosition {
             quote_asset_amount = quote_asset_amount.safe_sub(dust_base_asset_value.cast()?)?;
         }
 
-        let (lp_bids, lp_asks) = calculate_lp_open_bids_asks(self, market)?;
+        let (lp_bids, lp_asks) = calculate_lp_open_bids_asks(&settled_position, market)?;
 
-        let open_bids = self.open_bids.safe_add(lp_bids)?;
+        let open_bids = settled_position.open_bids.safe_add(lp_bids)?;
 
-        let open_asks = self.open_asks.safe_add(lp_asks)?;
+        let open_asks = settled_position.open_asks.safe_add(lp_asks)?;
 
-        Ok(PerpPosition {
-            base_asset_amount,
-            quote_asset_amount,
-            open_asks,
-            open_bids,
-            lp_shares: self.lp_shares,
-            // todo double check: this is ok because no other values are used in the future computations
-            ..PerpPosition::default()
-        })
+        settled_position.base_asset_amount = base_asset_amount;
+        settled_position.quote_asset_amount = quote_asset_amount;
+        settled_position.open_bids = open_bids;
+        settled_position.open_asks = open_asks;
+
+        Ok(settled_position)
     }
 
     pub fn has_unsettled_pnl(&self) -> bool {
@@ -742,6 +934,14 @@ impl PerpPosition {
                 .map(|delta| delta.max(0))?
                 .safe_add(pnl_pool_excess.max(0))?;
 
+            if max_positive_pnl < unrealized_pnl {
+                msg!(
+                    "Claimable pnl below position upnl: {} < {}",
+                    max_positive_pnl,
+                    unrealized_pnl
+                );
+            }
+
             Ok(unrealized_pnl.min(max_positive_pnl))
         } else {
             Ok(unrealized_pnl)
@@ -751,7 +951,7 @@ impl PerpPosition {
 
 pub type PerpPositions = [PerpPosition; 8];
 
-#[zero_copy]
+#[zero_copy(unsafe)]
 #[repr(C)]
 #[derive(AnchorSerialize, AnchorDeserialize, PartialEq, Debug, Eq)]
 pub struct Order {
@@ -822,6 +1022,10 @@ pub enum AssetType {
 }
 
 impl Order {
+    pub fn seconds_til_expiry(self, now: i64) -> i64 {
+        (self.max_ts - now).max(0)
+    }
+
     pub fn has_oracle_price_offset(self) -> bool {
         self.oracle_price_offset != 0
     }
@@ -1019,7 +1223,23 @@ impl Order {
     }
 
     pub fn is_resting_limit_order(&self, slot: u64) -> DriftResult<bool> {
-        Ok(self.is_limit_order() && (self.post_only || self.is_auction_complete(slot)?))
+        if !self.is_limit_order() {
+            return Ok(false);
+        }
+
+        if self.order_type == OrderType::TriggerLimit {
+            return match self.direction {
+                PositionDirection::Long if self.trigger_price < self.price => {
+                    return Ok(false);
+                }
+                PositionDirection::Short if self.trigger_price > self.price => {
+                    return Ok(false);
+                }
+                _ => self.is_auction_complete(slot),
+            };
+        }
+
+        Ok(self.post_only || self.is_auction_complete(slot)?)
     }
 }
 
@@ -1108,7 +1328,7 @@ impl Default for MarketType {
     }
 }
 
-#[account(zero_copy)]
+#[account(zero_copy(unsafe))]
 #[derive(Eq, PartialEq, Debug)]
 #[repr(C)]
 pub struct UserStats {
@@ -1270,9 +1490,18 @@ impl UserStats {
     pub fn get_total_30d_volume(&self) -> DriftResult<u64> {
         self.taker_volume_30d.safe_add(self.maker_volume_30d)
     }
+
+    pub fn get_age_ts(&self, now: i64) -> i64 {
+        // upper bound of age of the user stats account
+        let min_action_ts: i64 = self
+            .last_filler_volume_30d_ts
+            .min(self.last_maker_volume_30d_ts)
+            .min(self.last_taker_volume_30d_ts);
+        now.saturating_sub(min_action_ts).max(0)
+    }
 }
 
-#[account(zero_copy)]
+#[account(zero_copy(unsafe))]
 #[derive(Default, Eq, PartialEq, Debug)]
 #[repr(C)]
 pub struct ReferrerName {

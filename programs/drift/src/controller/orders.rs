@@ -6,7 +6,9 @@ use std::u64;
 use anchor_lang::prelude::*;
 use solana_program::msg;
 
+use crate::controller;
 use crate::controller::funding::settle_funding_payment;
+use crate::controller::lp::burn_lp_shares;
 use crate::controller::position;
 use crate::controller::position::{
     add_new_position, decrease_open_bids_and_asks, get_position_index, increase_open_bids_and_asks,
@@ -14,8 +16,7 @@ use crate::controller::position::{
     PositionDirection,
 };
 use crate::controller::spot_balance::{
-    transfer_spot_balance_to_revenue_pool, update_spot_balances,
-    update_spot_market_cumulative_interest,
+    update_spot_balances, update_spot_market_cumulative_interest,
 };
 use crate::controller::spot_position::{
     decrease_spot_open_bids_and_asks, increase_spot_open_bids_and_asks,
@@ -23,16 +24,16 @@ use crate::controller::spot_position::{
 };
 use crate::error::DriftResult;
 use crate::error::ErrorCode;
-use crate::instructions::{OrderParams, PlaceOrderOptions};
+use crate::get_struct_values;
+use crate::get_then_update_id;
 use crate::load_mut;
 use crate::math::amm_jit::calculate_amm_jit_liquidity;
-use crate::math::auction::calculate_auction_prices;
+use crate::math::auction::{calculate_auction_params_for_trigger_order, calculate_auction_prices};
 use crate::math::casting::Cast;
 use crate::math::constants::{
-    BASE_PRECISION_U64, FEE_POOL_TO_REVENUE_POOL_THRESHOLD, FIVE_MINUTE, ONE_HOUR, PERP_DECIMALS,
-    QUOTE_SPOT_MARKET_INDEX,
+    BASE_PRECISION_U64, FIVE_MINUTE, ONE_HOUR, PERP_DECIMALS, QUOTE_SPOT_MARKET_INDEX,
 };
-use crate::math::fees::{ExternalFillFees, FillFees};
+use crate::math::fees::{determine_user_fee_tier, ExternalFillFees, FillFees};
 use crate::math::fulfillment::{
     determine_perp_fulfillment_methods, determine_spot_fulfillment_methods,
 };
@@ -47,19 +48,25 @@ use crate::math::safe_math::SafeMath;
 use crate::math::spot_balance::{get_signed_token_amount, get_token_amount};
 use crate::math::stats::calculate_new_twap;
 use crate::math::{amm, fees, margin::*, orders::*};
-use crate::{controller, PostOnlyParam};
-use crate::{get_struct_values, ModifyOrderParams};
-use crate::{get_then_update_id, ModifyOrderPolicy};
+use crate::state::order_params::{
+    ModifyOrderParams, ModifyOrderPolicy, OrderParams, PlaceOrderOptions, PostOnlyParam,
+};
 
 use crate::math::amm::calculate_amm_available_liquidity;
+use crate::math::lp::calculate_lp_shares_to_burn_for_risk_reduction;
 use crate::math::safe_unwrap::SafeUnwrap;
 use crate::math::spot_swap::select_margin_type_for_swap;
 use crate::print_error;
-use crate::state::events::{emit_stack, get_order_action_record, OrderActionRecord, OrderRecord};
+use crate::state::events::{
+    emit_stack, get_order_action_record, LPAction, LPRecord, OrderActionRecord, OrderRecord,
+};
 use crate::state::events::{OrderAction, OrderActionExplanation};
+use crate::state::fill_mode::FillMode;
 use crate::state::fulfillment::{PerpFulfillmentMethod, SpotFulfillmentMethod};
-use crate::state::oracle::OraclePriceData;
+use crate::state::margin_calculation::{MarginCalculation, MarginContext};
+use crate::state::oracle::{OraclePriceData, StrictOraclePrice};
 use crate::state::oracle_map::OracleMap;
+use crate::state::paused_operations::PerpOperation;
 use crate::state::perp_market::{AMMLiquiditySplit, MarketStatus, PerpMarket};
 use crate::state::perp_market_map::PerpMarketMap;
 use crate::state::spot_fulfillment_params::{ExternalSpotFill, SpotFulfillmentParams};
@@ -75,7 +82,9 @@ use crate::state::user::{MarketType, User};
 use crate::state::user_map::{UserMap, UserStatsMap};
 use crate::validate;
 use crate::validation;
-use crate::validation::order::{validate_order, validate_spot_order};
+use crate::validation::order::{
+    validate_order, validate_order_for_force_reduce_only, validate_spot_order,
+};
 
 #[cfg(test)]
 mod tests;
@@ -87,18 +96,17 @@ mod amm_lp_jit_tests;
 
 pub fn place_perp_order(
     state: &State,
-    user: &AccountLoader<User>,
+    user: &mut User,
+    user_key: Pubkey,
     perp_market_map: &PerpMarketMap,
     spot_market_map: &SpotMarketMap,
     oracle_map: &mut OracleMap,
     clock: &Clock,
-    params: OrderParams,
-    options: PlaceOrderOptions,
+    mut params: OrderParams,
+    mut options: PlaceOrderOptions,
 ) -> DriftResult {
     let now = clock.unix_timestamp;
     let slot = clock.slot;
-    let user_key = user.key();
-    let user = &mut load_mut!(user)?;
 
     validate_user_not_being_liquidated(
         user,
@@ -122,17 +130,12 @@ pub fn place_perp_order(
         )?;
     }
 
-    let max_ts = match params.max_ts {
-        Some(max_ts) => max_ts,
-        None => match params.order_type {
-            OrderType::Market | OrderType::Oracle => now.safe_add(30)?,
-            _ => 0_i64,
-        },
-    };
-
-    if max_ts != 0 && max_ts < now {
-        msg!("max_ts ({}) < now ({}), skipping order", max_ts, now);
-        return Ok(());
+    if user.is_reduce_only() {
+        validate!(
+            params.reduce_only,
+            ErrorCode::UserReduceOnly,
+            "order must be reduce only"
+        )?;
     }
 
     let new_order_index = user
@@ -164,16 +167,13 @@ pub fn place_perp_order(
     )?;
 
     validate!(
-        market.is_active(now)?,
+        !market.is_in_settlement(now),
         ErrorCode::MarketPlaceOrderPaused,
         "Market is in settlement mode",
     )?;
 
     let position_index = get_position_index(&user.perp_positions, market_index)
         .or_else(|_| add_new_position(&mut user.perp_positions, market_index))?;
-
-    let worst_case_base_asset_amount_before =
-        user.perp_positions[position_index].worst_case_base_asset_amount()?;
 
     // Increment open orders for existing position
     let (existing_position_direction, order_base_asset_amount) = {
@@ -209,12 +209,31 @@ pub fn place_perp_order(
     };
 
     let oracle_price_data = oracle_map.get_price_data(&market.amm.oracle)?;
+
+    // updates auction params for crossing limit orders w/out auction duration
+    params.update_perp_auction_params(market, oracle_price_data.price)?;
+
     let (auction_start_price, auction_end_price, auction_duration) = get_auction_params(
         &params,
         oracle_price_data,
         market.amm.order_tick_size,
         state.min_perp_auction_duration,
     )?;
+
+    let max_ts = match params.max_ts {
+        Some(max_ts) => max_ts,
+        None => match params.order_type {
+            OrderType::Market | OrderType::Oracle => {
+                now.safe_add(30_i64.max((auction_duration / 2) as i64))?
+            }
+            _ => 0_i64,
+        },
+    };
+
+    if max_ts != 0 && max_ts < now {
+        msg!("max_ts ({}) < now ({}), skipping order", max_ts, now);
+        return Ok(());
+    }
 
     validate!(
         params.market_type == MarketType::Perp,
@@ -270,6 +289,13 @@ pub fn place_perp_order(
         Err(err) => return Err(err),
     };
 
+    let risk_increasing = is_new_order_risk_increasing(
+        &new_order,
+        user.perp_positions[position_index].base_asset_amount,
+        user.perp_positions[position_index].open_bids,
+        user.perp_positions[position_index].open_asks,
+    )?;
+
     user.increment_open_orders(new_order.has_auction());
     user.orders[new_order_index] = new_order;
     user.perp_positions[position_index].open_orders += 1;
@@ -281,42 +307,28 @@ pub fn place_perp_order(
         )?;
     }
 
-    let worst_case_base_asset_amount_after =
-        user.perp_positions[position_index].worst_case_base_asset_amount()?;
-
-    let position_base_asset_amount = user.perp_positions[position_index].base_asset_amount;
-    let order_risk_reducing = is_order_risk_decreasing(
-        &params.direction,
-        order_base_asset_amount,
-        position_base_asset_amount,
-    )?;
-
-    let risk_decreasing = worst_case_base_asset_amount_after.unsigned_abs()
-        <= worst_case_base_asset_amount_before.unsigned_abs()
-        && order_risk_reducing;
+    options.update_risk_increasing(risk_increasing);
 
     // when orders are placed in bulk, only need to check margin on last place
     if options.enforce_margin_check {
-        // Order fails if it's risk increasing and it brings the user collateral below the margin requirement
-        let meets_initial_margin_requirement = meets_place_order_margin_requirement(
+        meets_place_order_margin_requirement(
             user,
             perp_market_map,
             spot_market_map,
             oracle_map,
-            risk_decreasing,
+            options.risk_increasing,
         )?;
-
-        if !meets_initial_margin_requirement {
-            return Err(ErrorCode::InvalidOrderForInitialMarginReq);
-        }
     }
 
-    if force_reduce_only && !risk_decreasing {
-        return Err(ErrorCode::InvalidOrderNotRiskReducing);
+    if force_reduce_only {
+        validate_order_for_force_reduce_only(
+            &user.orders[new_order_index],
+            user.perp_positions[position_index].base_asset_amount,
+        )?;
     }
 
     let max_oi = market.amm.max_open_interest;
-    if max_oi != 0 && !risk_decreasing {
+    if max_oi != 0 && risk_increasing {
         let oi_plus_order = match params.direction {
             PositionDirection::Long => market
                 .amm
@@ -345,7 +357,7 @@ pub fn place_perp_order(
     let order_action_record = get_order_action_record(
         now,
         OrderAction::Place,
-        OrderActionExplanation::None,
+        options.explanation,
         market_index,
         None,
         None,
@@ -403,7 +415,16 @@ fn get_auction_params(
                     // if auction is non-zero, force it to be at least min_auction_duration
                     auction_duration.max(min_auction_duration)
                 };
-                Ok((auction_start_price, auction_end_price, auction_duration))
+
+                Ok((
+                    standardize_price_i64(
+                        auction_start_price,
+                        tick_size.cast()?,
+                        params.direction,
+                    )?,
+                    standardize_price_i64(auction_end_price, tick_size.cast()?, params.direction)?,
+                    auction_duration,
+                ))
             }
             _ => Ok((0_i64, 0_i64, 0_u8)),
         };
@@ -733,15 +754,14 @@ pub fn modify_order(
 
     user.update_last_active_slot(clock.slot);
 
-    drop(user);
-
     let order_params =
         merge_modify_order_params_with_existing_order(&existing_order, &modify_order_params)?;
 
     if order_params.market_type == MarketType::Perp {
         place_perp_order(
             state,
-            user_loader,
+            &mut user,
+            user_key,
             perp_market_map,
             spot_market_map,
             oracle_map,
@@ -752,7 +772,8 @@ pub fn modify_order(
     } else {
         place_spot_order(
             state,
-            user_loader,
+            &mut user,
+            user_key,
             perp_market_map,
             spot_market_map,
             oracle_map,
@@ -809,15 +830,19 @@ fn merge_modify_order_params_with_existing_order(
     let oracle_price_offset = modify_order_params
         .oracle_price_offset
         .or(Some(existing_order.oracle_price_offset));
-    let auction_duration = modify_order_params
-        .auction_duration
-        .or(Some(existing_order.auction_duration));
-    let auction_start_price = modify_order_params
-        .auction_start_price
-        .or(Some(existing_order.auction_start_price));
-    let auction_end_price = modify_order_params
-        .auction_end_price
-        .or(Some(existing_order.auction_end_price));
+    let (auction_duration, auction_start_price, auction_end_price) =
+        if modify_order_params.auction_duration.is_some()
+            && modify_order_params.auction_start_price.is_some()
+            && modify_order_params.auction_end_price.is_some()
+        {
+            (
+                modify_order_params.auction_duration,
+                modify_order_params.auction_start_price,
+                modify_order_params.auction_end_price,
+            )
+        } else {
+            (None, None, None)
+        };
 
     Ok(OrderParams {
         order_type,
@@ -854,6 +879,7 @@ pub fn fill_perp_order(
     makers_and_referrer_stats: &UserStatsMap,
     jit_maker_order_id: Option<u32>,
     clock: &Clock,
+    fill_mode: FillMode,
 ) -> DriftResult<u64> {
     let now = clock.unix_timestamp;
     let slot = clock.slot;
@@ -890,13 +916,16 @@ pub fn fill_perp_order(
     validate!(
         matches!(
             market.status,
-            MarketStatus::Active
-                | MarketStatus::FundingPaused
-                | MarketStatus::ReduceOnly
-                | MarketStatus::WithdrawPaused
+            MarketStatus::Active | MarketStatus::ReduceOnly
         ),
         ErrorCode::MarketFillOrderPaused,
-        "Market unavailable for fills"
+        "Market not active",
+    )?;
+
+    validate!(
+        !market.is_operation_paused(PerpOperation::Fill),
+        ErrorCode::MarketFillOrderPaused,
+        "Market fills paused",
     )?;
 
     drop(market);
@@ -940,10 +969,10 @@ pub fn fill_perp_order(
     let mut amm_is_available = !state.amm_paused()?;
     {
         let market = &mut perp_market_map.get_ref_mut(&market_index)?;
-        amm_is_available &= market.status != MarketStatus::AmmPaused;
+        amm_is_available &= !market.is_operation_paused(PerpOperation::AmmFill);
         validation::perp_market::validate_perp_market(market)?;
         validate!(
-            market.is_active(now)?,
+            !market.is_in_settlement(now),
             ErrorCode::MarketFillOrderPaused,
             "Market is in settlement mode",
         )?;
@@ -1032,8 +1061,14 @@ pub fn fill_perp_order(
     let position_index =
         get_position_index(&user.perp_positions, user.orders[order_index].market_index)?;
     let existing_base_asset_amount = user.perp_positions[position_index].base_asset_amount;
-    let should_cancel_reduce_only =
-        should_cancel_reduce_only_order(&user.orders[order_index], existing_base_asset_amount)?;
+    let should_cancel_reduce_only = should_cancel_reduce_only_order(
+        &user.orders[order_index],
+        existing_base_asset_amount,
+        perp_market_map
+            .get_ref_mut(&market_index)?
+            .amm
+            .order_step_size,
+    )?;
 
     if should_expire_order || should_cancel_reduce_only {
         let filler_reward = {
@@ -1093,6 +1128,7 @@ pub fn fill_perp_order(
         slot,
         state.min_perp_auction_duration,
         amm_is_available,
+        fill_mode,
     )?;
 
     if base_asset_amount != 0 {
@@ -1112,8 +1148,14 @@ pub fn fill_perp_order(
     }
 
     let base_asset_amount_after = user.perp_positions[position_index].base_asset_amount;
-    let should_cancel_reduce_only =
-        should_cancel_reduce_only_order(&user.orders[order_index], base_asset_amount_after)?;
+    let should_cancel_reduce_only = should_cancel_reduce_only_order(
+        &user.orders[order_index],
+        base_asset_amount_after,
+        perp_market_map
+            .get_ref_mut(&market_index)?
+            .amm
+            .order_step_size,
+    )?;
 
     if should_cancel_reduce_only {
         let filler_reward = {
@@ -1168,13 +1210,14 @@ pub fn fill_perp_order(
     {
         let market = &mut perp_market_map.get_ref_mut(&market_index)?;
         let funding_paused =
-            state.funding_paused()? || matches!(market.status, MarketStatus::FundingPaused);
+            state.funding_paused()? || market.is_operation_paused(PerpOperation::UpdateFunding);
 
         controller::funding::update_funding_rate(
             market_index,
             market,
             oracle_map,
             now,
+            slot,
             &state.oracle_guard_rails,
             funding_paused,
             Some(reserve_price_before),
@@ -1234,7 +1277,7 @@ pub fn validate_market_within_price_band(
 
     // if oracle-mark divergence outside limit and risk-increasing, block order
     if is_oracle_mark_too_divergent_after && breach_increases && potentially_risk_increasing {
-        msg!("risk-increasing outside bounds: last_oracle_price_twap_5min={} vs mark_price={}, (breach spread {})", 
+        msg!("risk-increasing outside bounds: last_oracle_price_twap_5min={} vs mark_price={}, (breach spread {})",
                 market.amm.historical_oracle_data.last_oracle_price_twap_5min,
                 reserve_price_after,
                 oracle_reserve_price_spread_pct_after,
@@ -1297,7 +1340,7 @@ fn get_maker_orders_info(
         settle_funding_payment(&mut maker, maker_key, &mut market, now)?;
 
         let initial_margin_ratio = market.margin_ratio_initial;
-        let maintenance_margin_ratio = market.margin_ratio_maintenance;
+        let step_size = market.amm.order_step_size;
 
         drop(market);
 
@@ -1322,12 +1365,11 @@ fn get_maker_orders_info(
             }
 
             let breaches_oracle_price_limits = {
-                limit_price_breaches_oracle_price_bands(
+                limit_price_breaches_maker_oracle_price_bands(
                     maker_order_price,
                     maker_order.direction,
                     oracle_price,
                     initial_margin_ratio,
-                    maintenance_margin_ratio,
                 )?
             };
 
@@ -1339,6 +1381,7 @@ fn get_maker_orders_info(
             let should_cancel_reduce_only_order = should_cancel_reduce_only_order(
                 &maker.orders[maker_order_index],
                 existing_base_asset_amount,
+                step_size,
             )?;
 
             if breaches_oracle_price_limits
@@ -1439,15 +1482,11 @@ fn get_referrer_info(
             continue;
         }
 
-        validate!(
-            referrer.sub_account_id == 0,
-            ErrorCode::InvalidReferrer,
-            "Referrer must be user id 0"
-        )?;
-
-        referrer.update_last_active_slot(slot);
-
-        referrer_user_key = *referrer_key;
+        if referrer.sub_account_id == 0 {
+            referrer.update_last_active_slot(slot);
+            referrer_user_key = *referrer_key;
+            break;
+        }
     }
 
     if referrer_user_key == Pubkey::default() {
@@ -1479,11 +1518,19 @@ fn fulfill_perp_order(
     slot: u64,
     min_auction_duration: u8,
     amm_is_available: bool,
+    fill_mode: FillMode,
 ) -> DriftResult<(u64, u64)> {
     let market_index = user.orders[user_order_index].market_index;
 
     let user_order_position_decreasing =
         determine_if_user_order_is_position_decreasing(user, market_index, user_order_index)?;
+
+    let limit_price = fill_mode.get_limit_price(
+        &user.orders[user_order_index],
+        valid_oracle_price,
+        slot,
+        perp_market_map.get_ref(&market_index)?.amm.order_tick_size,
+    )?;
 
     let fulfillment_methods = {
         let market = perp_market_map.get_ref(&market_index)?;
@@ -1495,6 +1542,7 @@ fn fulfill_perp_order(
             &market.amm,
             reserve_price_before,
             Some(oracle_price),
+            limit_price,
             amm_is_available,
             slot,
             min_auction_duration,
@@ -1507,7 +1555,8 @@ fn fulfill_perp_order(
 
     let mut base_asset_amount = 0_u64;
     let mut quote_asset_amount = 0_u64;
-    let mut makers_filled: BTreeMap<Pubkey, bool> = BTreeMap::new();
+    let mut maker_fills: BTreeMap<Pubkey, i64> = BTreeMap::new();
+    let maker_direction = user.orders[user_order_index].direction.opposite();
     for fulfillment_method in fulfillment_methods.iter() {
         if user.orders[user_order_index].status != OrderStatus::Open {
             break;
@@ -1534,7 +1583,6 @@ fn fulfill_perp_order(
                         reserve_price_before,
                         now,
                         slot,
-                        valid_oracle_price,
                         user_key,
                         filler_key,
                         filler,
@@ -1542,6 +1590,7 @@ fn fulfill_perp_order(
                         &mut referrer.as_deref_mut(),
                         &mut referrer_stats.as_deref_mut(),
                         fee_structure,
+                        limit_price,
                         None,
                         *maker_price,
                         AMMLiquiditySplit::Shared,
@@ -1564,7 +1613,7 @@ fn fulfill_perp_order(
                     Some(&maker),
                 )?;
 
-                let (fill_base_asset_amount, fill_quote_asset_amount) =
+                let (fill_base_asset_amount, fill_quote_asset_amount, maker_fill_base_asset_amount) =
                     fulfill_perp_order_with_match(
                         market.deref_mut(),
                         user,
@@ -1582,14 +1631,20 @@ fn fulfill_perp_order(
                         &mut referrer_stats.as_deref_mut(),
                         reserve_price_before,
                         valid_oracle_price,
+                        limit_price,
                         now,
                         slot,
                         fee_structure,
                         oracle_map,
                     )?;
 
-                if fill_base_asset_amount != 0 {
-                    makers_filled.insert(*maker_key, true);
+                if maker_fill_base_asset_amount != 0 {
+                    update_maker_fills_map(
+                        &mut maker_fills,
+                        maker_key,
+                        maker_direction,
+                        maker_fill_base_asset_amount,
+                    )?;
                 }
 
                 (fill_base_asset_amount, fill_quote_asset_amount)
@@ -1611,47 +1666,62 @@ fn fulfill_perp_order(
         quote_asset_amount
     )?;
 
-    let (taker_margin_requirement, taker_total_collateral, _, _) =
-        calculate_margin_requirement_and_total_collateral(
+    let total_maker_fill = maker_fills.values().sum::<i64>();
+
+    validate!(
+        total_maker_fill.unsigned_abs() <= base_asset_amount,
+        ErrorCode::DefaultError,
+        "invalid total maker fill {} total fill {}",
+        total_maker_fill,
+        base_asset_amount
+    )?;
+
+    let taker_margin_calculation =
+        calculate_margin_requirement_and_total_collateral_and_liability_info(
             user,
             perp_market_map,
-            if user_order_position_decreasing {
+            spot_market_map,
+            oracle_map,
+            MarginContext::standard(if user_order_position_decreasing {
                 MarginRequirementType::Maintenance
             } else {
                 MarginRequirementType::Fill
-            },
-            spot_market_map,
-            oracle_map,
-            None,
+            }),
         )?;
-    if taker_total_collateral < taker_margin_requirement.cast()? {
+
+    if !taker_margin_calculation.meets_margin_requirement() {
         msg!(
             "taker breached fill requirements (margin requirement {}) (total_collateral {})",
-            taker_margin_requirement,
-            taker_total_collateral
+            taker_margin_calculation.margin_requirement,
+            taker_margin_calculation.total_collateral
         );
         return Err(ErrorCode::InsufficientCollateral);
     }
 
-    for (maker_key, _) in makers_filled {
+    for (maker_key, maker_base_asset_amount_filled) in maker_fills {
         let maker = makers_and_referrer.get_ref(&maker_key)?;
 
-        let (_, maker_total_collateral, maker_margin_requirement_plus_buffer, _) =
-            calculate_margin_requirement_and_total_collateral(
+        let margin_type = select_margin_type_for_perp_maker(
+            &maker,
+            maker_base_asset_amount_filled,
+            market_index,
+        )?;
+
+        let maker_margin_calculation =
+            calculate_margin_requirement_and_total_collateral_and_liability_info(
                 &maker,
                 perp_market_map,
-                MarginRequirementType::Fill,
                 spot_market_map,
                 oracle_map,
-                None,
+                MarginContext::standard(margin_type),
             )?;
 
-        if maker_total_collateral < maker_margin_requirement_plus_buffer.cast()? {
+        if !maker_margin_calculation.meets_margin_requirement() {
             msg!(
                 "maker ({}) breached fill requirements (margin requirement {}) (total_collateral {})",
                 maker_key,
-                maker_margin_requirement_plus_buffer,
-                maker_total_collateral
+                maker_margin_calculation.margin_requirement,
+                maker_margin_calculation.total_collateral
             );
             return Err(ErrorCode::InsufficientCollateral);
         }
@@ -1684,6 +1754,27 @@ fn get_referrer<'a>(
     Ok((Some(referrer), Some(referrer_stats)))
 }
 
+#[inline(always)]
+fn update_maker_fills_map(
+    map: &mut BTreeMap<Pubkey, i64>,
+    maker_key: &Pubkey,
+    maker_direction: PositionDirection,
+    fill: u64,
+) -> DriftResult {
+    let signed_fill = match maker_direction {
+        PositionDirection::Long => fill.cast::<i64>()?,
+        PositionDirection::Short => -fill.cast::<i64>()?,
+    };
+
+    if let Some(maker_filled) = map.get_mut(maker_key) {
+        *maker_filled = maker_filled.safe_add(signed_fill)?;
+    } else {
+        map.insert(*maker_key, signed_fill);
+    }
+
+    Ok(())
+}
+
 fn determine_if_user_order_is_position_decreasing(
     user: &User,
     market_index: u16,
@@ -1709,7 +1800,6 @@ pub fn fulfill_perp_order_with_amm(
     reserve_price_before: u64,
     now: i64,
     slot: u64,
-    valid_oracle_price: Option<i64>,
     user_key: &Pubkey,
     filler_key: &Pubkey,
     filler: &mut Option<&mut User>,
@@ -1717,33 +1807,28 @@ pub fn fulfill_perp_order_with_amm(
     referrer: &mut Option<&mut User>,
     referrer_stats: &mut Option<&mut UserStats>,
     fee_structure: &FeeStructure,
+    limit_price: Option<u64>,
     override_base_asset_amount: Option<u64>,
     override_fill_price: Option<u64>,
     liquidity_split: AMMLiquiditySplit,
 ) -> DriftResult<(u64, u64)> {
     let position_index = get_position_index(&user.perp_positions, market.market_index)?;
+    let existing_base_asset_amount = user.perp_positions[position_index].base_asset_amount;
 
     // Determine the base asset amount the market can fill
     let (base_asset_amount, limit_price, fill_price) = match override_base_asset_amount {
         Some(override_base_asset_amount) => {
-            let limit_price = user.orders[order_index].get_limit_price(
-                valid_oracle_price,
-                None,
-                slot,
-                market.amm.order_tick_size,
-            )?;
-
             (override_base_asset_amount, limit_price, override_fill_price)
         }
         None => {
-            let existing_base_asset_amount = user.perp_positions[position_index].base_asset_amount;
+            let fee_tier = determine_user_fee_tier(user_stats, fee_structure, &MarketType::Perp)?;
             let (base_asset_amount, limit_price) = calculate_base_asset_amount_for_amm_to_fulfill(
                 &user.orders[order_index],
                 market,
-                valid_oracle_price,
-                slot,
+                limit_price,
                 override_fill_price,
                 existing_base_asset_amount,
+                fee_tier,
             )?;
 
             let fill_price = if user.orders[order_index].post_only {
@@ -1756,11 +1841,20 @@ pub fn fulfill_perp_order_with_amm(
         }
     };
 
-    if base_asset_amount < market.amm.min_order_size {
+    // if user position is less than min order size, step size is the threshold
+    let amm_size_threshold =
+        if existing_base_asset_amount.unsigned_abs() > market.amm.min_order_size {
+            market.amm.min_order_size
+        } else {
+            market.amm.order_step_size
+        };
+
+    if base_asset_amount < amm_size_threshold {
         // if is an actual swap (and not amm jit order) then msg!
         if override_base_asset_amount.is_none() {
             msg!(
-                "Amm cant fulfill order. base asset amount {} market.amm.min_order_size {}",
+                "Amm cant fulfill order. market index {} base asset amount {} market.amm.min_order_size {}",
+                market.market_index,
                 base_asset_amount,
                 market.amm.min_order_size
             );
@@ -1818,7 +1912,7 @@ pub fn fulfill_perp_order_with_amm(
         referee_discount,
         referrer_reward,
         fee_to_market_for_lp,
-        ..
+        maker_rebate,
     } = fees::calculate_fee_for_fulfillment_with_amm(
         user_stats,
         quote_asset_amount,
@@ -1830,6 +1924,7 @@ pub fn fulfill_perp_order_with_amm(
         referrer_stats,
         quote_asset_amount_surplus,
         order_post_only,
+        market.fee_adjustment,
     )?;
 
     let user_position_delta =
@@ -1876,6 +1971,7 @@ pub fn fulfill_perp_order_with_amm(
 
     // Increment the user's total fee variables
     user_stats.increment_total_fees(user_fee)?;
+    user_stats.increment_total_rebate(maker_rebate)?;
     user_stats.increment_total_referee_discount(referee_discount)?;
 
     if let (Some(referrer), Some(referrer_stats)) = (referrer.as_mut(), referrer_stats.as_mut()) {
@@ -1889,11 +1985,21 @@ pub fn fulfill_perp_order_with_amm(
 
     let position_index = get_position_index(&user.perp_positions, market.market_index)?;
 
-    controller::position::update_quote_asset_and_break_even_amount(
-        &mut user.perp_positions[position_index],
-        market,
-        -user_fee.cast()?,
-    )?;
+    if user_fee != 0 {
+        controller::position::update_quote_asset_and_break_even_amount(
+            &mut user.perp_positions[position_index],
+            market,
+            -user_fee.cast()?,
+        )?;
+    }
+
+    if maker_rebate != 0 {
+        controller::position::update_quote_asset_and_break_even_amount(
+            &mut user.perp_positions[position_index],
+            market,
+            maker_rebate.cast()?,
+        )?;
+    }
 
     if order_post_only {
         user_stats.update_maker_volume_30d(quote_asset_amount, now)?;
@@ -1951,7 +2057,11 @@ pub fn fulfill_perp_order_with_amm(
         Some(base_asset_amount),
         Some(quote_asset_amount),
         Some(user_fee),
-        None,
+        if maker_rebate != 0 {
+            Some(maker_rebate)
+        } else {
+            None
+        },
         Some(referrer_reward),
         Some(quote_asset_amount_surplus),
         None,
@@ -1991,36 +2101,34 @@ pub fn fulfill_perp_order_with_match(
     referrer_stats: &mut Option<&mut UserStats>,
     reserve_price_before: u64,
     valid_oracle_price: Option<i64>,
+    taker_limit_price: Option<u64>,
     now: i64,
     slot: u64,
     fee_structure: &FeeStructure,
     oracle_map: &mut OracleMap,
-) -> DriftResult<(u64, u64)> {
+) -> DriftResult<(u64, u64, u64)> {
     if !are_orders_same_market_but_different_sides(
         &maker.orders[maker_order_index],
         &taker.orders[taker_order_index],
     ) {
-        return Ok((0_u64, 0_u64));
+        return Ok((0_u64, 0_u64, 0_u64));
     }
 
-    let (bid_price, ask_price) = market.amm.bid_ask_price(market.amm.reserve_price()?)?;
-
     let oracle_price = oracle_map.get_price_data(&market.amm.oracle)?.price;
-    let taker_direction = taker.orders[taker_order_index].direction;
-    let amm_available_liquidity = calculate_amm_available_liquidity(&market.amm, &taker_direction)?;
-    let taker_fallback_price = get_fallback_price(
-        &taker_direction,
-        bid_price,
-        ask_price,
-        amm_available_liquidity,
-        oracle_price,
-    )?;
-    let taker_price = taker.orders[taker_order_index].force_get_limit_price(
-        Some(oracle_price),
-        Some(taker_fallback_price),
-        slot,
-        market.amm.order_tick_size,
-    )?;
+    let taker_direction: PositionDirection = taker.orders[taker_order_index].direction;
+
+    let taker_price = if let Some(taker_limit_price) = taker_limit_price {
+        taker_limit_price
+    } else {
+        let amm_available_liquidity =
+            calculate_amm_available_liquidity(&market.amm, &taker_direction)?;
+        market.amm.get_fallback_price(
+            &taker_direction,
+            amm_available_liquidity,
+            oracle_price,
+            taker.orders[taker_order_index].seconds_til_expiry(now),
+        )?
+    };
 
     let taker_existing_position = taker
         .get_perp_position(market.market_index)?
@@ -2049,7 +2157,7 @@ pub fn fulfill_perp_order_with_match(
             maker_price,
             taker_price
         );
-        return Ok((0_u64, 0_u64));
+        return Ok((0_u64, 0_u64, 0_u64));
     }
 
     let (base_asset_amount, _) = calculate_fill_for_matched_orders(
@@ -2061,7 +2169,7 @@ pub fn fulfill_perp_order_with_match(
     )?;
 
     if base_asset_amount == 0 {
-        return Ok((0_u64, 0_u64));
+        return Ok((0_u64, 0_u64, 0_u64));
     }
 
     let sanitize_clamp_denominator = market.get_sanitize_clamp_denominator()?;
@@ -2098,7 +2206,6 @@ pub fn fulfill_perp_order_with_match(
                 reserve_price_before,
                 now,
                 slot,
-                valid_oracle_price,
                 taker_key,
                 filler_key,
                 filler,
@@ -2106,6 +2213,7 @@ pub fn fulfill_perp_order_with_match(
                 &mut None,
                 &mut None,
                 fee_structure,
+                taker_limit_price,
                 Some(jit_base_asset_amount),
                 Some(maker_price), // match the makers price
                 amm_liquidity_split,
@@ -2122,17 +2230,18 @@ pub fn fulfill_perp_order_with_match(
     let taker_base_asset_amount = taker.orders[taker_order_index]
         .get_base_asset_amount_unfilled(Some(taker_existing_position))?;
 
-    let (base_asset_amount_fulfilled, quote_asset_amount) = calculate_fill_for_matched_orders(
-        maker_base_asset_amount,
-        maker_price,
-        taker_base_asset_amount,
-        PERP_DECIMALS,
-        maker_direction,
-    )?;
+    let (base_asset_amount_fulfilled_by_maker, quote_asset_amount) =
+        calculate_fill_for_matched_orders(
+            maker_base_asset_amount,
+            maker_price,
+            taker_base_asset_amount,
+            PERP_DECIMALS,
+            maker_direction,
+        )?;
 
     validate_fill_price(
         quote_asset_amount,
-        base_asset_amount_fulfilled,
+        base_asset_amount_fulfilled_by_maker,
         BASE_PRECISION_U64,
         taker_direction,
         taker_price,
@@ -2141,14 +2250,15 @@ pub fn fulfill_perp_order_with_match(
 
     validate_fill_price(
         quote_asset_amount,
-        base_asset_amount_fulfilled,
+        base_asset_amount_fulfilled_by_maker,
         BASE_PRECISION_U64,
         maker_direction,
         maker_price,
         false,
     )?;
 
-    total_base_asset_amount = total_base_asset_amount.safe_add(base_asset_amount_fulfilled)?;
+    total_base_asset_amount =
+        total_base_asset_amount.safe_add(base_asset_amount_fulfilled_by_maker)?;
     total_quote_asset_amount = total_quote_asset_amount.safe_add(quote_asset_amount)?;
 
     let maker_position_index = get_position_index(
@@ -2157,7 +2267,7 @@ pub fn fulfill_perp_order_with_match(
     )?;
 
     let maker_position_delta = get_position_delta_for_fill(
-        base_asset_amount_fulfilled,
+        base_asset_amount_fulfilled_by_maker,
         quote_asset_amount,
         maker.orders[maker_order_index].direction,
     )?;
@@ -2181,7 +2291,7 @@ pub fn fulfill_perp_order_with_match(
     )?;
 
     let taker_position_delta = get_position_delta_for_fill(
-        base_asset_amount_fulfilled,
+        base_asset_amount_fulfilled_by_maker,
         quote_asset_amount,
         taker.orders[taker_order_index].direction,
     )?;
@@ -2222,6 +2332,7 @@ pub fn fulfill_perp_order_with_match(
         reward_referrer,
         referrer_stats,
         &MarketType::Perp,
+        market.fee_adjustment,
     )?;
 
     // Increment the markets house's total fee variables
@@ -2292,26 +2403,26 @@ pub fn fulfill_perp_order_with_match(
 
     update_order_after_fill(
         &mut taker.orders[taker_order_index],
-        base_asset_amount_fulfilled,
+        base_asset_amount_fulfilled_by_maker,
         quote_asset_amount,
     )?;
 
     decrease_open_bids_and_asks(
         &mut taker.perp_positions[taker_position_index],
         &taker.orders[taker_order_index].direction,
-        base_asset_amount_fulfilled,
+        base_asset_amount_fulfilled_by_maker,
     )?;
 
     update_order_after_fill(
         &mut maker.orders[maker_order_index],
-        base_asset_amount_fulfilled,
+        base_asset_amount_fulfilled_by_maker,
         quote_asset_amount,
     )?;
 
     decrease_open_bids_and_asks(
         &mut maker.perp_positions[maker_position_index],
         &maker.orders[maker_order_index].direction,
-        base_asset_amount_fulfilled,
+        base_asset_amount_fulfilled_by_maker,
     )?;
 
     let fill_record_id = get_then_update_id!(market, next_fill_record_id);
@@ -2328,7 +2439,7 @@ pub fn fulfill_perp_order_with_match(
         Some(*filler_key),
         Some(fill_record_id),
         Some(filler_reward),
-        Some(base_asset_amount_fulfilled),
+        Some(base_asset_amount_fulfilled_by_maker),
         Some(quote_asset_amount),
         Some(taker_fee),
         Some(maker_rebate),
@@ -2357,7 +2468,11 @@ pub fn fulfill_perp_order_with_match(
         market_position.open_orders -= 1;
     }
 
-    Ok((total_base_asset_amount, total_quote_asset_amount))
+    Ok((
+        total_base_asset_amount,
+        total_quote_asset_amount,
+        base_asset_amount_fulfilled_by_maker,
+    ))
 }
 
 pub fn update_order_after_fill(
@@ -2474,28 +2589,25 @@ pub fn trigger_order(
     )?;
     validate!(can_trigger, ErrorCode::OrderDidNotSatisfyTriggerCondition)?;
 
+    let worst_case_base_asset_amount_before = user
+        .get_perp_position(market_index)?
+        .worst_case_base_asset_amount()?;
+
     {
+        update_trigger_order_params(
+            &mut user.orders[order_index],
+            oracle_price_data,
+            slot,
+            30,
+            Some(&perp_market),
+        )?;
+
+        if user.orders[order_index].has_auction() {
+            user.increment_open_auctions();
+        }
+
         let direction = user.orders[order_index].direction;
         let base_asset_amount = user.orders[order_index].base_asset_amount;
-
-        user.orders[order_index].trigger_condition =
-            match user.orders[order_index].trigger_condition {
-                OrderTriggerCondition::Above => OrderTriggerCondition::TriggeredAbove,
-                OrderTriggerCondition::Below => OrderTriggerCondition::TriggeredBelow,
-                _ => {
-                    return Err(print_error!(ErrorCode::InvalidTriggerOrderCondition)());
-                }
-            };
-
-        user.orders[order_index].slot = slot;
-        let order_type = user.orders[order_index].order_type;
-        if let OrderType::TriggerMarket = order_type {
-            user.orders[order_index].auction_duration = state.min_perp_auction_duration;
-            let (auction_start_price, auction_end_price) =
-                calculate_auction_prices(oracle_price_data, direction, 0)?;
-            user.orders[order_index].auction_start_price = auction_start_price;
-            user.orders[order_index].auction_end_price = auction_end_price;
-        }
 
         let user_position = user.get_perp_position_mut(market_index)?;
         increase_open_bids_and_asks(user_position, &direction, base_asset_amount)?;
@@ -2541,36 +2653,34 @@ pub fn trigger_order(
 
     drop(perp_market);
 
-    // If order is risk increasing and user is below initial margin, cancel it
-    let order_direction = user.orders[order_index].direction;
-    let order_base_asset_amount = user.orders[order_index].base_asset_amount;
-    let position_base_asset_amount = user
-        .force_get_perp_position_mut(market_index)?
-        .base_asset_amount;
-    let is_risk_increasing = is_order_risk_increasing(
-        &order_direction,
-        order_base_asset_amount,
-        position_base_asset_amount,
-    )?;
+    let worst_case_base_asset_amount_after = user
+        .get_perp_position(market_index)?
+        .worst_case_base_asset_amount()?;
 
-    let meets_initial_margin_requirement =
-        meets_initial_margin_requirement(user, perp_market_map, spot_market_map, oracle_map)?;
+    let is_risk_increasing = worst_case_base_asset_amount_after.unsigned_abs()
+        > worst_case_base_asset_amount_before.unsigned_abs();
 
-    if is_risk_increasing && !meets_initial_margin_requirement {
-        cancel_order(
-            order_index,
-            user,
-            &user_key,
-            perp_market_map,
-            spot_market_map,
-            oracle_map,
-            now,
-            slot,
-            OrderActionExplanation::InsufficientFreeCollateral,
-            Some(&filler_key),
-            0,
-            false,
-        )?;
+    // If order increases risk and user is below initial margin, cancel it
+    if is_risk_increasing && !user.orders[order_index].reduce_only {
+        let meets_initial_margin_requirement =
+            meets_initial_margin_requirement(user, perp_market_map, spot_market_map, oracle_map)?;
+
+        if !meets_initial_margin_requirement {
+            cancel_order(
+                order_index,
+                user,
+                &user_key,
+                perp_market_map,
+                spot_market_map,
+                oracle_map,
+                now,
+                slot,
+                OrderActionExplanation::InsufficientFreeCollateral,
+                Some(&filler_key),
+                0,
+                false,
+            )?;
+        }
     }
 
     user.update_last_active_slot(slot);
@@ -2578,9 +2688,48 @@ pub fn trigger_order(
     Ok(())
 }
 
+fn update_trigger_order_params(
+    order: &mut Order,
+    oracle_price_data: &OraclePriceData,
+    slot: u64,
+    min_auction_duration: u8,
+    perp_market: Option<&PerpMarket>,
+) -> DriftResult {
+    order.trigger_condition = match order.trigger_condition {
+        OrderTriggerCondition::Above => OrderTriggerCondition::TriggeredAbove,
+        OrderTriggerCondition::Below => OrderTriggerCondition::TriggeredBelow,
+        _ => {
+            return Err(print_error!(ErrorCode::InvalidTriggerOrderCondition)());
+        }
+    };
+
+    order.slot = slot;
+
+    let (auction_duration, auction_start_price, auction_end_price) =
+        calculate_auction_params_for_trigger_order(
+            order,
+            oracle_price_data,
+            min_auction_duration,
+            perp_market,
+        )?;
+
+    msg!(
+        "new auction duration {} start price {} end price {}",
+        auction_duration,
+        auction_start_price,
+        auction_end_price
+    );
+
+    order.auction_duration = auction_duration;
+    order.auction_start_price = auction_start_price;
+    order.auction_end_price = auction_end_price;
+
+    Ok(())
+}
+
 pub fn force_cancel_orders(
     state: &State,
-    user: &AccountLoader<User>,
+    user_account_loader: &AccountLoader<User>,
     spot_market_map: &SpotMarketMap,
     perp_market_map: &PerpMarketMap,
     oracle_map: &mut OracleMap,
@@ -2591,8 +2740,8 @@ pub fn force_cancel_orders(
     let slot = clock.slot;
 
     let filler_key = filler.key();
-    let user_key = user.key();
-    let user = &mut load_mut!(user)?;
+    let user_key = user_account_loader.key();
+    let user = &mut load_mut!(user_account_loader)?;
     let filler = &mut load_mut!(filler)?;
 
     validate!(
@@ -2602,8 +2751,15 @@ pub fn force_cancel_orders(
 
     validate!(!user.is_bankrupt(), ErrorCode::UserBankrupt)?;
 
-    let meets_initial_margin_requirement =
-        meets_initial_margin_requirement(user, perp_market_map, spot_market_map, oracle_map)?;
+    let margin_calc = calculate_margin_requirement_and_total_collateral_and_liability_info(
+        user,
+        perp_market_map,
+        spot_market_map,
+        oracle_map,
+        MarginContext::standard(MarginRequirementType::Initial),
+    )?;
+
+    let meets_initial_margin_requirement = margin_calc.meets_margin_requirement();
 
     validate!(
         !meets_initial_margin_requirement,
@@ -2677,6 +2833,7 @@ pub fn force_cancel_orders(
         Some(filler),
         spot_market_map.get_quote_spot_market_mut()?.deref_mut(),
         total_fee,
+        slot,
     )?;
 
     user.update_last_active_slot(slot);
@@ -2689,6 +2846,125 @@ pub fn can_reward_user_with_perp_pnl(user: &mut Option<&mut User>, market_index:
         Some(user) => user.force_get_perp_position_mut(market_index).is_ok(),
         None => false,
     }
+}
+
+pub fn attempt_burn_user_lp_shares_for_risk_reduction(
+    state: &State,
+    user: &mut User,
+    user_key: Pubkey,
+    margin_calc: MarginCalculation,
+    perp_market_map: &PerpMarketMap,
+    spot_market_map: &SpotMarketMap,
+    oracle_map: &mut OracleMap,
+    clock: &Clock,
+    market_index: u16,
+) -> DriftResult {
+    let now = clock.unix_timestamp;
+    let time_since_last_liquidity_change: i64 = now.safe_sub(user.last_add_perp_lp_shares_ts)?;
+    // avoid spamming update if orders have already been set
+    if time_since_last_liquidity_change >= state.lp_cooldown_time.cast()? {
+        burn_user_lp_shares_for_risk_reduction(
+            state,
+            user,
+            user_key,
+            market_index,
+            margin_calc,
+            perp_market_map,
+            spot_market_map,
+            oracle_map,
+            clock,
+        )?;
+        user.last_add_perp_lp_shares_ts = now;
+    }
+
+    Ok(())
+}
+
+pub fn burn_user_lp_shares_for_risk_reduction(
+    state: &State,
+    user: &mut User,
+    user_key: Pubkey,
+    market_index: u16,
+    margin_calc: MarginCalculation,
+    perp_market_map: &PerpMarketMap,
+    spot_market_map: &SpotMarketMap,
+    oracle_map: &mut OracleMap,
+    clock: &Clock,
+) -> DriftResult {
+    let position_index = get_position_index(&user.perp_positions, market_index)?;
+    let is_lp = user.perp_positions[position_index].is_lp();
+    if !is_lp {
+        return Ok(());
+    }
+
+    let mut market = perp_market_map.get_ref_mut(&market_index)?;
+
+    let quote_oracle = spot_market_map
+        .get_ref(&market.quote_spot_market_index)?
+        .oracle;
+    let quote_oracle_price = oracle_map.get_price_data(&quote_oracle)?.price;
+
+    let oracle_price_data = oracle_map.get_price_data(&market.amm.oracle)?;
+
+    let oracle_price = if market.status == MarketStatus::Settlement {
+        market.expiry_price
+    } else {
+        oracle_price_data.price
+    };
+
+    let user_custom_margin_ratio = user.max_margin_ratio;
+    let (lp_shares_to_burn, base_asset_amount_to_close) =
+        calculate_lp_shares_to_burn_for_risk_reduction(
+            &user.perp_positions[position_index],
+            &market,
+            oracle_price,
+            quote_oracle_price,
+            margin_calc.margin_shortage()?,
+            user_custom_margin_ratio,
+        )?;
+
+    let (position_delta, pnl) = burn_lp_shares(
+        &mut user.perp_positions[position_index],
+        &mut market,
+        lp_shares_to_burn,
+        oracle_price,
+    )?;
+
+    // emit LP record for shares removed
+    emit_stack::<_, { LPRecord::SIZE }>(LPRecord {
+        ts: clock.unix_timestamp,
+        action: LPAction::RemoveLiquidityDerisk,
+        user: user_key,
+        n_shares: lp_shares_to_burn,
+        market_index,
+        delta_base_asset_amount: position_delta.base_asset_amount,
+        delta_quote_asset_amount: position_delta.quote_asset_amount,
+        pnl,
+    })?;
+
+    let direction_to_close = user.perp_positions[position_index].get_direction_to_close();
+
+    let params = OrderParams::get_close_perp_params(
+        &market,
+        direction_to_close,
+        base_asset_amount_to_close,
+    )?;
+
+    drop(market);
+
+    controller::orders::place_perp_order(
+        state,
+        user,
+        user_key,
+        perp_market_map,
+        spot_market_map,
+        oracle_map,
+        clock,
+        params,
+        PlaceOrderOptions::default().explanation(OrderActionExplanation::DeriskLp),
+    )?;
+
+    Ok(())
 }
 
 pub fn pay_keeper_flat_reward_for_perps(
@@ -2731,6 +3007,7 @@ pub fn pay_keeper_flat_reward_for_spot(
     filler: Option<&mut User>,
     quote_market: &mut SpotMarket,
     filler_reward: u64,
+    slot: u64,
 ) -> DriftResult<u64> {
     let filler_reward = if let Some(filler) = filler {
         update_spot_balances(
@@ -2740,6 +3017,8 @@ pub fn pay_keeper_flat_reward_for_spot(
             filler.get_quote_spot_position_mut(),
             false,
         )?;
+
+        filler.update_last_active_slot(slot);
 
         filler.update_cumulative_spot_fees(filler_reward.cast()?)?;
 
@@ -2763,18 +3042,17 @@ pub fn pay_keeper_flat_reward_for_spot(
 
 pub fn place_spot_order(
     state: &State,
-    user: &AccountLoader<User>,
+    user: &mut User,
+    user_key: Pubkey,
     perp_market_map: &PerpMarketMap,
     spot_market_map: &SpotMarketMap,
     oracle_map: &mut OracleMap,
     clock: &Clock,
     params: OrderParams,
-    options: PlaceOrderOptions,
+    mut options: PlaceOrderOptions,
 ) -> DriftResult {
     let now = clock.unix_timestamp;
     let slot = clock.slot;
-    let user_key = user.key();
-    let user = &mut load_mut!(user)?;
 
     validate_user_not_being_liquidated(
         user,
@@ -2795,6 +3073,14 @@ pub fn place_spot_order(
             oracle_map,
             now,
             slot,
+        )?;
+    }
+
+    if user.is_reduce_only() {
+        validate!(
+            params.reduce_only,
+            ErrorCode::UserReduceOnly,
+            "order must be reduce only"
         )?;
     }
 
@@ -2844,13 +3130,11 @@ pub fn place_spot_order(
         .get_spot_position_index(market_index)
         .or_else(|_| user.add_spot_position(market_index, SpotBalanceType::Deposit))?;
 
-    let oracle_price_data = *oracle_map.get_price_data(&spot_market.oracle)?;
-    let (worst_case_token_amount_before, _) = user.spot_positions[spot_position_index]
-        .get_worst_case_token_amount(spot_market, &oracle_price_data, None, None)?;
-
     let balance_type = user.spot_positions[spot_position_index].balance_type;
     let token_amount = user.spot_positions[spot_position_index].get_token_amount(spot_market)?;
     let signed_token_amount = get_signed_token_amount(token_amount, &balance_type)?;
+
+    let oracle_price_data = *oracle_map.get_price_data(&spot_market.oracle)?;
 
     // Increment open orders for existing position
     let (existing_position_direction, order_base_asset_amount) = {
@@ -2952,6 +3236,13 @@ pub fn place_spot_order(
         spot_market.min_order_size,
     )?;
 
+    let risk_increasing = is_new_order_risk_increasing(
+        &new_order,
+        signed_token_amount.cast()?,
+        user.spot_positions[spot_position_index].open_bids,
+        user.spot_positions[spot_position_index].open_asks,
+    )?;
+
     user.increment_open_orders(new_order.has_auction());
     user.orders[new_order_index] = new_order;
     user.spot_positions[spot_position_index].open_orders += 1;
@@ -2963,35 +3254,25 @@ pub fn place_spot_order(
         )?;
     }
 
-    let (worst_case_token_amount_after, _) = user.spot_positions[spot_position_index]
-        .get_worst_case_token_amount(spot_market, &oracle_price_data, None, None)?;
-
-    let order_risk_decreasing =
-        is_spot_order_risk_decreasing(&user.orders[new_order_index], &balance_type, token_amount)?;
-
-    // Order fails if it's risk increasing and it brings the user collateral below the margin requirement
-    let risk_decreasing = worst_case_token_amount_after.unsigned_abs()
-        <= worst_case_token_amount_before.unsigned_abs()
-        && order_risk_decreasing;
+    options.update_risk_increasing(risk_increasing);
 
     if options.enforce_margin_check {
-        let meets_initial_margin_requirement = meets_place_order_margin_requirement(
+        meets_place_order_margin_requirement(
             user,
             perp_market_map,
             spot_market_map,
             oracle_map,
-            risk_decreasing,
+            options.risk_increasing,
         )?;
-
-        if !meets_initial_margin_requirement {
-            return Err(ErrorCode::InvalidOrderForInitialMarginReq);
-        }
     }
 
     validate_spot_margin_trading(user, spot_market_map, oracle_map)?;
 
-    if force_reduce_only && !risk_decreasing {
-        return Err(ErrorCode::InvalidOrderNotRiskReducing);
+    if force_reduce_only {
+        validate_order_for_force_reduce_only(
+            &user.orders[new_order_index],
+            signed_token_amount.cast()?,
+        )?;
     }
 
     let (taker, taker_order, maker, maker_order) =
@@ -3184,7 +3465,11 @@ pub fn fill_spot_order(
         let spot_market = spot_market_map.get_ref(&market_index)?;
         let signed_token_amount =
             user.spot_positions[position_index].get_signed_token_amount(&spot_market)?;
-        should_cancel_reduce_only_order(&user.orders[order_index], signed_token_amount.cast()?)?
+        should_cancel_reduce_only_order(
+            &user.orders[order_index],
+            signed_token_amount.cast()?,
+            spot_market.order_step_size,
+        )?
     } else {
         false
     };
@@ -3197,6 +3482,7 @@ pub fn fill_spot_order(
                 filler.as_deref_mut(),
                 &mut quote_market,
                 state.spot_fee_structure.flat_filler_fee,
+                slot,
             )?
         };
 
@@ -3276,7 +3562,11 @@ pub fn fill_spot_order(
         let spot_market = spot_market_map.get_ref(&market_index)?;
         let signed_token_amount =
             user.spot_positions[position_index].get_signed_token_amount(&spot_market)?;
-        should_cancel_reduce_only_order(&user.orders[order_index], signed_token_amount.cast()?)?
+        should_cancel_reduce_only_order(
+            &user.orders[order_index],
+            signed_token_amount.cast()?,
+            spot_market.order_step_size,
+        )?
     } else {
         false
     };
@@ -3300,6 +3590,7 @@ pub fn fill_spot_order(
                 filler.as_deref_mut(),
                 &mut quote_market,
                 state.spot_fee_structure.flat_filler_fee,
+                slot,
             )?
         };
 
@@ -3420,15 +3711,12 @@ fn get_spot_maker_order<'a>(
     let breaches_oracle_price_limits = {
         let oracle_price = oracle_map.get_price_data(&spot_market.oracle)?;
         let initial_margin_ratio = spot_market.get_margin_ratio(&MarginRequirementType::Initial)?;
-        let maintenance_margin_ratio =
-            spot_market.get_margin_ratio(&MarginRequirementType::Maintenance)?;
-        order_breaches_oracle_price_bands(
+        order_breaches_maker_oracle_price_bands(
             &maker.orders[maker_order_index],
             oracle_price.price,
             slot,
             spot_market.order_tick_size,
             initial_margin_ratio,
-            maintenance_margin_ratio,
         )?
     };
 
@@ -3442,6 +3730,7 @@ fn get_spot_maker_order<'a>(
         should_cancel_reduce_only_order(
             &maker.orders[maker_order_index],
             signed_token_amount.cast()?,
+            spot_market.order_step_size,
         )?
     } else {
         false
@@ -3455,6 +3744,7 @@ fn get_spot_maker_order<'a>(
                 filler.as_deref_mut(),
                 &mut quote_market,
                 filler_reward,
+                slot,
             )?
         };
 
@@ -3598,13 +3888,28 @@ fn fulfill_spot_order(
     let quote_price = oracle_map.get_price_data(&quote_market.oracle)?.price;
     let base_price = oracle_map.get_price_data(&base_market.oracle)?.price;
 
+    let strict_quote_price = StrictOraclePrice::new(
+        quote_price,
+        quote_market
+            .historical_oracle_data
+            .last_oracle_price_twap_5min,
+        true,
+    );
+    let strict_base_price = StrictOraclePrice::new(
+        base_price,
+        base_market
+            .historical_oracle_data
+            .last_oracle_price_twap_5min,
+        true,
+    );
+
     let margin_type = if order_direction == PositionDirection::Long {
         // sell quote, buy base
         select_margin_type_for_swap(
             &quote_market,
             &base_market,
-            quote_price,
-            base_price,
+            &strict_quote_price,
+            &strict_base_price,
             quote_token_amount_before,
             base_token_amount_before,
             quote_token_amount_after,
@@ -3616,8 +3921,8 @@ fn fulfill_spot_order(
         select_margin_type_for_swap(
             &base_market,
             &quote_market,
-            base_price,
-            quote_price,
+            &strict_base_price,
+            &strict_quote_price,
             base_token_amount_before,
             quote_token_amount_before,
             base_token_amount_after,
@@ -3629,42 +3934,40 @@ fn fulfill_spot_order(
     drop(base_market);
     drop(quote_market);
 
-    let (taker_margin_requirement, taker_total_collateral, _, _) =
-        calculate_margin_requirement_and_total_collateral(
+    let taker_margin_calculation =
+        calculate_margin_requirement_and_total_collateral_and_liability_info(
             user,
             perp_market_map,
-            margin_type,
             spot_market_map,
             oracle_map,
-            None,
+            MarginContext::standard(margin_type),
         )?;
 
-    if taker_total_collateral < taker_margin_requirement.cast()? {
+    if !taker_margin_calculation.meets_margin_requirement() {
         msg!(
             "taker breached maintenance requirements (margin requirement {}) (total_collateral {})",
-            taker_margin_requirement,
-            taker_total_collateral
+            taker_margin_calculation.margin_requirement,
+            taker_margin_calculation.total_collateral
         );
         return Err(ErrorCode::InsufficientCollateral);
     }
 
     if let Some(maker) = maker {
-        let (maker_margin_requirement, maker_total_collateral, _, _) =
-            calculate_margin_requirement_and_total_collateral(
+        let maker_margin_calculation =
+            calculate_margin_requirement_and_total_collateral_and_liability_info(
                 maker,
                 perp_market_map,
-                MarginRequirementType::Fill,
                 spot_market_map,
                 oracle_map,
-                None,
+                MarginContext::standard(MarginRequirementType::Fill),
             )?;
 
-        if maker_total_collateral < maker_margin_requirement.cast()? {
+        if !maker_margin_calculation.meets_margin_requirement() {
             msg!(
                 "maker ({}) breached maintenance requirements (margin requirement {}) (total_collateral {})",
                 maker_key.safe_unwrap()?,
-                maker_margin_requirement,
-                maker_total_collateral
+                maker_margin_calculation.margin_requirement,
+                maker_margin_calculation.total_collateral
             );
             return Err(ErrorCode::InsufficientCollateral);
         }
@@ -3844,6 +4147,7 @@ pub fn fulfill_spot_order_with_match(
         false,
         &None,
         &MarketType::Spot,
+        0,
     )?;
 
     // Update taker state
@@ -3963,20 +4267,6 @@ pub fn fulfill_spot_order_with_match(
         &mut base_market.spot_fee_pool,
         false,
     )?;
-
-    let fee_pool_amount = get_token_amount(
-        base_market.spot_fee_pool.scaled_balance,
-        quote_market,
-        &SpotBalanceType::Deposit,
-    )?;
-
-    if fee_pool_amount > FEE_POOL_TO_REVENUE_POOL_THRESHOLD * 2 {
-        transfer_spot_balance_to_revenue_pool(
-            fee_pool_amount - FEE_POOL_TO_REVENUE_POOL_THRESHOLD,
-            quote_market,
-            &mut base_market.spot_fee_pool,
-        )?;
-    }
 
     let fill_record_id = get_then_update_id!(base_market, next_fill_record_id);
     let order_action_explanation = if maker.orders[maker_order_index].is_jit_maker() {
@@ -4169,14 +4459,6 @@ pub fn fulfill_spot_order_with_external_market(
         &SpotBalanceType::Deposit,
     )?;
 
-    if fee_pool_amount > FEE_POOL_TO_REVENUE_POOL_THRESHOLD * 2 {
-        transfer_spot_balance_to_revenue_pool(
-            fee_pool_amount - FEE_POOL_TO_REVENUE_POOL_THRESHOLD,
-            quote_market,
-            &mut base_market.spot_fee_pool,
-        )?;
-    }
-
     let ExternalFillFees {
         user_fee: taker_fee,
         fee_to_market,
@@ -4192,6 +4474,7 @@ pub fn fulfill_spot_order_with_external_market(
         external_market_fee,
         unsettled_referrer_rebate,
         fee_pool_amount.cast()?,
+        0,
     )?;
 
     let quote_spot_position_delta = match quote_update_direction {
@@ -4386,6 +4669,14 @@ pub fn trigger_spot_order(
         &spot_market.oracle,
         spot_market.historical_oracle_data.last_oracle_price_twap,
     )?;
+    let strict_oracle_price = StrictOraclePrice {
+        current: oracle_price_data.price,
+        twap_5min: Some(
+            spot_market
+                .historical_oracle_data
+                .last_oracle_price_twap_5min,
+        ),
+    };
 
     validate!(
         is_oracle_valid_for_action(oracle_validity, Some(DriftAction::TriggerOrder))?,
@@ -4402,27 +4693,33 @@ pub fn trigger_spot_order(
     )?;
     validate!(can_trigger, ErrorCode::OrderDidNotSatisfyTriggerCondition)?;
 
+    let position_index = user.get_spot_position_index(market_index)?;
+    let signed_token_amount =
+        user.spot_positions[position_index].get_signed_token_amount(&spot_market)?;
+
+    let worst_case_simulation_before = user.spot_positions[position_index]
+        .get_worst_case_fill_simulation(
+            &spot_market,
+            &strict_oracle_price,
+            Some(signed_token_amount),
+            MarginRequirementType::Initial,
+        )?;
+
     {
+        update_trigger_order_params(
+            &mut user.orders[order_index],
+            oracle_price_data,
+            slot,
+            30,
+            None,
+        )?;
+
+        if user.orders[order_index].has_auction() {
+            user.increment_open_auctions();
+        }
+
         let direction = user.orders[order_index].direction;
         let base_asset_amount = user.orders[order_index].base_asset_amount;
-
-        user.orders[order_index].trigger_condition =
-            match user.orders[order_index].trigger_condition {
-                OrderTriggerCondition::Above => OrderTriggerCondition::TriggeredAbove,
-                OrderTriggerCondition::Below => OrderTriggerCondition::TriggeredBelow,
-                _ => {
-                    return Err(print_error!(ErrorCode::InvalidTriggerOrderCondition)());
-                }
-            };
-        user.orders[order_index].slot = slot;
-        let order_type = user.orders[order_index].order_type;
-        if let OrderType::TriggerMarket = order_type {
-            user.orders[order_index].auction_duration = state.default_spot_auction_duration;
-            let (auction_start_price, auction_end_price) =
-                calculate_auction_prices(oracle_price_data, direction, 0)?;
-            user.orders[order_index].auction_start_price = auction_start_price;
-            user.orders[order_index].auction_end_price = auction_end_price;
-        }
 
         let user_position = user.force_get_spot_position_mut(market_index)?;
         increase_spot_open_bids_and_asks(user_position, &direction, base_asset_amount.cast()?)?;
@@ -4441,6 +4738,7 @@ pub fn trigger_spot_order(
         filler.as_deref_mut(),
         &mut quote_market,
         state.spot_fee_structure.flat_filler_fee,
+        slot,
     )?;
 
     let order_action_record = get_order_action_record(
@@ -4467,35 +4765,42 @@ pub fn trigger_spot_order(
 
     emit!(order_action_record);
 
-    let position_index = user.get_spot_position_index(market_index)?;
-    let token_amount = user.spot_positions[position_index].get_token_amount(&spot_market)?;
+    let worst_case_simulation_after = user
+        .get_spot_position(market_index)?
+        .get_worst_case_fill_simulation(
+            &spot_market,
+            &strict_oracle_price,
+            Some(signed_token_amount),
+            MarginRequirementType::Initial,
+        )?;
 
     drop(spot_market);
     drop(quote_market);
 
-    // If order is risk increasing and user is below initial margin, cancel it
-    let balance_type = user.spot_positions[position_index].balance_type;
     let is_risk_increasing =
-        is_spot_order_risk_increasing(&user.orders[order_index], &balance_type, token_amount)?;
+        worst_case_simulation_before.risk_increasing(worst_case_simulation_after);
 
-    let meets_initial_margin_requirement =
-        meets_initial_margin_requirement(user, perp_market_map, spot_market_map, oracle_map)?;
+    // If order is risk increasing and user is below initial margin, cancel it
+    if is_risk_increasing && !user.orders[order_index].reduce_only {
+        let meets_initial_margin_requirement =
+            meets_initial_margin_requirement(user, perp_market_map, spot_market_map, oracle_map)?;
 
-    if is_risk_increasing && !meets_initial_margin_requirement {
-        cancel_order(
-            order_index,
-            user,
-            &user_key,
-            perp_market_map,
-            spot_market_map,
-            oracle_map,
-            now,
-            slot,
-            OrderActionExplanation::InsufficientFreeCollateral,
-            Some(&filler_key),
-            0,
-            false,
-        )?;
+        if !meets_initial_margin_requirement {
+            cancel_order(
+                order_index,
+                user,
+                &user_key,
+                perp_market_map,
+                spot_market_map,
+                oracle_map,
+                now,
+                slot,
+                OrderActionExplanation::InsufficientFreeCollateral,
+                Some(&filler_key),
+                0,
+                false,
+            )?;
+        }
     }
 
     user.update_last_active_slot(slot);

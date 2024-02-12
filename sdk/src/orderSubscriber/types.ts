@@ -1,3 +1,5 @@
+import { Commitment, PublicKey } from '@solana/web3.js';
+import { Order, UserAccount } from '../types';
 import { DriftClient } from '../driftClient';
 
 export type OrderSubscriberConfig = {
@@ -6,9 +8,35 @@ export type OrderSubscriberConfig = {
 		| {
 				type: 'polling';
 				frequency: number;
+				commitment?: Commitment;
 		  }
 		| {
 				type: 'websocket';
 				skipInitialLoad?: boolean;
+				resubTimeoutMs?: number;
+				resyncIntervalMs?: number;
+				commitment?: Commitment;
 		  };
+	fastDecode?: boolean;
 };
+
+export interface OrderSubscriberEvents {
+	orderCreated: (
+		account: UserAccount,
+		updatedOrders: Order[],
+		pubkey: PublicKey,
+		slot: number,
+		dataType: 'raw' | 'decoded'
+	) => void;
+	userUpdated: (
+		account: UserAccount,
+		pubkey: PublicKey,
+		slot: number,
+		dataType: 'raw' | 'decoded'
+	) => void;
+	updateReceived: (
+		pubkey: PublicKey,
+		slot: number,
+		dataType: 'raw' | 'decoded'
+	) => void;
+}

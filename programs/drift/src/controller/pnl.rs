@@ -1,6 +1,9 @@
 use crate::controller::amm::{update_pnl_pool_and_user_balance, update_pool_balances};
 use crate::controller::funding::settle_funding_payment;
-use crate::controller::orders::{cancel_orders, validate_market_within_price_band};
+use crate::controller::orders::{
+    attempt_burn_user_lp_shares_for_risk_reduction, cancel_orders,
+    validate_market_within_price_band,
+};
 use crate::controller::position::{
     get_position_index, update_position_and_market, update_quote_asset_amount,
     update_quote_asset_and_break_even_amount, update_settled_pnl, PositionDelta,
@@ -12,13 +15,18 @@ use crate::error::{DriftResult, ErrorCode};
 use crate::math::amm::calculate_net_user_pnl;
 
 use crate::math::casting::Cast;
-use crate::math::margin::meets_maintenance_margin_requirement;
+use crate::math::margin::{
+    calculate_margin_requirement_and_total_collateral_and_liability_info,
+    meets_maintenance_margin_requirement, MarginRequirementType,
+};
 use crate::math::position::calculate_base_asset_value_with_expiry_price;
 use crate::math::safe_math::SafeMath;
 use crate::math::spot_balance::get_token_amount;
+use crate::state::margin_calculation::MarginContext;
 
 use crate::state::events::{OrderActionExplanation, SettlePnlExplanation, SettlePnlRecord};
 use crate::state::oracle_map::OracleMap;
+use crate::state::paused_operations::PerpOperation;
 use crate::state::perp_market::MarketStatus;
 use crate::state::perp_market_map::PerpMarketMap;
 use crate::state::spot_market::{SpotBalance, SpotBalanceType};
@@ -45,11 +53,11 @@ pub fn settle_pnl(
     perp_market_map: &PerpMarketMap,
     spot_market_map: &SpotMarketMap,
     oracle_map: &mut OracleMap,
-    now: i64,
+    clock: &Clock,
     state: &State,
 ) -> DriftResult {
     validate!(!user.is_bankrupt(), ErrorCode::UserBankrupt)?;
-
+    let now = clock.unix_timestamp;
     {
         let spot_market = &mut spot_market_map.get_quote_spot_market_mut()?;
         update_spot_market_cumulative_interest(spot_market, None, now)?;
@@ -68,15 +76,53 @@ pub fn settle_pnl(
     let unrealized_pnl = user.perp_positions[position_index].get_unrealized_pnl(oracle_price)?;
 
     // cannot settle negative pnl this way on a user who is in liquidation territory
-    if unrealized_pnl < 0
-        && !meets_maintenance_margin_requirement(
+    if user.perp_positions[position_index].is_lp() && !user.is_advanced_lp() {
+        let margin_calc = calculate_margin_requirement_and_total_collateral_and_liability_info(
             user,
             perp_market_map,
             spot_market_map,
             oracle_map,
-        )?
-    {
-        return Err(ErrorCode::InsufficientCollateralForSettlingPNL);
+            MarginContext::standard(MarginRequirementType::Initial)
+                .margin_buffer(state.liquidation_margin_buffer_ratio),
+        )?;
+
+        if !margin_calc.meets_margin_requirement() {
+            msg!("lp does not meet initial margin requirement, attempting to burn shares for risk reduction");
+            attempt_burn_user_lp_shares_for_risk_reduction(
+                state,
+                user,
+                *user_key,
+                margin_calc,
+                perp_market_map,
+                spot_market_map,
+                oracle_map,
+                clock,
+                market_index,
+            )?;
+
+            // if the unrealized pnl is negative, return early after trying to burn shares
+            if unrealized_pnl < 0
+                && !(meets_maintenance_margin_requirement(
+                    user,
+                    perp_market_map,
+                    spot_market_map,
+                    oracle_map,
+                )?)
+            {
+                msg!("Unable to settle negative pnl as user is in liquidation territory");
+                return Ok(());
+            }
+        }
+    } else if unrealized_pnl < 0 {
+        // cannot settle pnl this way on a user who is in liquidation territory
+        if !(meets_maintenance_margin_requirement(
+            user,
+            perp_market_map,
+            spot_market_map,
+            oracle_map,
+        )?) {
+            return Err(ErrorCode::InsufficientCollateralForSettlingPNL);
+        }
     }
 
     let spot_market = &mut spot_market_map.get_quote_spot_market_mut()?;
@@ -105,15 +151,41 @@ pub fn settle_pnl(
         "Cannot settle pnl under current market status"
     )?;
 
+    validate!(
+        !perp_market.is_operation_paused(PerpOperation::SettlePnl),
+        ErrorCode::InvalidMarketStatusToSettlePnl,
+        "Cannot settle pnl under current market status"
+    )?;
+
+    if user.perp_positions[position_index].base_asset_amount != 0 {
+        validate!(
+            !perp_market.is_operation_paused(PerpOperation::SettlePnlWithPosition),
+            ErrorCode::InvalidMarketStatusToSettlePnl,
+            "Cannot settle pnl with position under current market status"
+        )?;
+    }
+
     let pnl_pool_token_amount = get_token_amount(
         perp_market.pnl_pool.scaled_balance,
         spot_market,
         perp_market.pnl_pool.balance_type(),
+    )?;
+
+    let fraction_of_fee_pool_token_amount = get_token_amount(
+        perp_market.amm.fee_pool.scaled_balance,
+        spot_market,
+        perp_market.amm.fee_pool.balance_type(),
     )?
-    .cast()?;
+    .safe_div(5)?;
+
+    // add a buffer from fee pool for pnl pool balance
+    let pnl_tokens_available: i128 = pnl_pool_token_amount
+        .safe_add(fraction_of_fee_pool_token_amount)?
+        .cast()?;
+
     let net_user_pnl = calculate_net_user_pnl(&perp_market.amm, oracle_price)?;
-    let max_pnl_pool_excess = if net_user_pnl < pnl_pool_token_amount {
-        pnl_pool_token_amount.safe_sub(net_user_pnl.max(0))?
+    let max_pnl_pool_excess = if net_user_pnl < pnl_tokens_available {
+        pnl_tokens_available.safe_sub(net_user_pnl.max(0))?
     } else {
         0
     };
@@ -199,8 +271,7 @@ pub fn settle_expired_position(
     perp_market_map: &PerpMarketMap,
     spot_market_map: &SpotMarketMap,
     oracle_map: &mut OracleMap,
-    now: i64,
-    slot: u64,
+    clock: &Clock,
     state: &State,
 ) -> DriftResult {
     validate!(!user.is_bankrupt(), ErrorCode::UserBankrupt)?;
@@ -212,6 +283,8 @@ pub fn settle_expired_position(
     }
 
     let fee_structure = &state.perp_fee_structure;
+    let now = clock.unix_timestamp;
+    let slot = clock.slot;
 
     {
         let quote_spot_market = &mut spot_market_map.get_quote_spot_market_mut()?;

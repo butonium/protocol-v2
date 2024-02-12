@@ -20,6 +20,7 @@ export type SpotMarketConfig = {
 	precisionExp: BN;
 	serumMarket?: PublicKey;
 	phoenixMarket?: PublicKey;
+	launchTs?: number;
 };
 
 export const WRAPPED_SOL_MINT = new PublicKey(
@@ -113,6 +114,9 @@ export const MainnetSpotMarkets: SpotMarketConfig[] = [
 		precision: new BN(10).pow(EIGHT),
 		precisionExp: EIGHT,
 		serumMarket: new PublicKey('BbJgE7HZMaDp5NTYvRh5jZSkQPVDTU8ubPFtpogUkEj4'),
+		phoenixMarket: new PublicKey(
+			'Ew3vFDdtdGrknJAVVfraxCA37uNJtimXYPY4QjnfhFHH'
+		),
 	},
 	{
 		symbol: 'USDT',
@@ -123,6 +127,78 @@ export const MainnetSpotMarkets: SpotMarketConfig[] = [
 		precision: QUOTE_PRECISION,
 		precisionExp: QUOTE_PRECISION_EXP,
 		serumMarket: new PublicKey('B2na8Awyd7cpC59iEU43FagJAPLigr3AP3s38KM982bu'),
+	},
+	{
+		symbol: 'jitoSOL',
+		marketIndex: 6,
+		oracle: new PublicKey('7yyaeuJ1GGtVBLT2z2xub5ZWYKaNhF28mj1RdV4VDFVk'),
+		oracleSource: OracleSource.PYTH,
+		mint: new PublicKey('J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn'),
+		precision: new BN(10).pow(NINE),
+		precisionExp: NINE,
+		serumMarket: new PublicKey('DkbVbMhFxswS32xnn1K2UY4aoBugXooBTxdzkWWDWRkH'),
+	},
+	{
+		symbol: 'PYTH',
+		marketIndex: 7,
+		oracle: new PublicKey('nrYkQQQur7z8rYTST3G9GqATviK5SxTDkrqd21MW6Ue'),
+		oracleSource: OracleSource.PYTH,
+		mint: new PublicKey('HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3'),
+		precision: new BN(10).pow(SIX),
+		precisionExp: SIX,
+		serumMarket: new PublicKey('4E17F3BxtNVqzVsirxguuqkpYLtFgCR6NfTpccPh82WE'),
+		phoenixMarket: new PublicKey(
+			'2sTMN9A1D1qeZLF95XQgJCUPiKe5DiV52jLfZGqMP46m'
+		),
+	},
+	{
+		symbol: 'bSOL',
+		marketIndex: 8,
+		oracle: new PublicKey('AFrYBhb5wKQtxRS9UA9YRS4V3dwFm7SqmS6DHKq6YVgo'),
+		oracleSource: OracleSource.PYTH,
+		mint: new PublicKey('bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1'),
+		precision: new BN(10).pow(NINE),
+		precisionExp: NINE,
+		serumMarket: new PublicKey('ARjaHVxGCQfTvvKjLd7U7srvk6orthZSE6uqWchCczZc'),
+	},
+	{
+		symbol: 'JTO',
+		marketIndex: 9,
+		oracle: new PublicKey('D8UUgr8a3aR3yUeHLu7v8FWK7E8Y5sSU7qrYBXUJXBQ5'),
+		oracleSource: OracleSource.PYTH,
+		mint: new PublicKey('jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL'),
+		precision: new BN(10).pow(NINE),
+		precisionExp: NINE,
+		serumMarket: new PublicKey('H87FfmHABiZLRGrDsXRZtqq25YpARzaokCzL1vMYGiep'),
+		phoenixMarket: new PublicKey(
+			'BRLLmdtPGuuFn3BU6orYw4KHaohAEptBToi3dwRUnHQZ'
+		),
+	},
+	{
+		symbol: 'WIF',
+		marketIndex: 10,
+		oracle: new PublicKey('6ABgrEZk8urs6kJ1JNdC1sspH5zKXRqxy8sg3ZG2cQps'),
+		oracleSource: OracleSource.PYTH,
+		mint: new PublicKey('EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm'),
+		precision: new BN(10).pow(SIX),
+		precisionExp: SIX,
+		serumMarket: new PublicKey('2BtDHBTCTUxvdur498ZEcMgimasaFrY5GzLv8wS8XgCb'),
+		phoenixMarket: new PublicKey(
+			'6ojSigXF7nDPyhFRgmn3V9ywhYseKF9J32ZrranMGVSX'
+		),
+	},
+	{
+		symbol: 'JUP',
+		marketIndex: 11,
+		oracle: new PublicKey('g6eRCbboSwK4tSWngn773RCMexr1APQr4uA9bGZBYfo'),
+		oracleSource: OracleSource.PYTH,
+		mint: new PublicKey('JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN'),
+		precision: new BN(10).pow(SIX),
+		precisionExp: SIX,
+		phoenixMarket: new PublicKey(
+			'2pspvjWWaf3dNgt3jsgSzFCNvMGPb7t8FrEYvLGjvcCe'
+		),
+		launchTs: 1706731200000,
 	},
 ];
 

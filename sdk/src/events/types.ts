@@ -15,6 +15,7 @@ import {
 	CurveRecord,
 	SwapRecord,
 } from '../index';
+import { EventEmitter } from 'events';
 
 export type EventSubscriptionOptions = {
 	address?: PublicKey;
@@ -64,6 +65,7 @@ export type EventSubscriptionOrderDirection = 'asc' | 'desc';
 export type Event<T> = T & {
 	txSig: TransactionSignature;
 	slot: number;
+	txSigIndex: number; // Unique index for each event inside a tx
 };
 
 export type WrappedEvent<Type extends EventType> = EventMap[Type] & {
@@ -125,17 +127,26 @@ export type logProviderCallback = (
 
 export interface LogProvider {
 	isSubscribed(): boolean;
-	subscribe(callback: logProviderCallback, skipHistory?: boolean): boolean;
-	unsubscribe(): Promise<boolean>;
+	subscribe(
+		callback: logProviderCallback,
+		skipHistory?: boolean
+	): Promise<boolean>;
+	unsubscribe(external?: boolean): Promise<boolean>;
+	eventEmitter?: EventEmitter;
 }
 
 export type WebSocketLogProviderConfig = {
 	type: 'websocket';
+	resubTimeoutMs?: number;
+	maxReconnectAttempts?: number;
+	fallbackFrequency?: number;
+	fallbackBatchSize?: number;
 };
 
 export type PollingLogProviderConfig = {
 	type: 'polling';
 	frequency: number;
+	batchSize?: number;
 };
 
 export type LogProviderConfig =
