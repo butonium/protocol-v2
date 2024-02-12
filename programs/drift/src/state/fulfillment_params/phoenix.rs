@@ -457,6 +457,8 @@ impl<'a, 'b> SpotFulfillmentParams for PhoenixFulfillmentParams<'a, 'b> {
                     })?,
             ),
             use_only_deposited_funds: false,
+            last_valid_slot: None,
+            last_valid_unix_timestamp_in_seconds: None,
             // TIF parameters
         };
 
